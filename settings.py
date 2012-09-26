@@ -21,7 +21,7 @@
 import os, sys
 
 PROJECT_ROOT = os.path.abspath(os.path.dirname(__file__))
-DEFAULT_PROTOCOL  = 'https'
+DEFAULT_PROTOCOL  = 'http'
 
 def rel(*x):
     return os.path.join(PROJECT_ROOT, *x)
@@ -178,6 +178,7 @@ JS_DIALOG = \
      'js/srtwriter.js',
      'js/widget/unsavedwarning.js',
      'js/widget/emptysubswarningdialog.js',
+     'js/widget/confirmdialog.js',
      'js/widget/droplockdialog.js',
      'js/finishfaildialog/dialog.js',
      'js/finishfaildialog/errorpanel.js',
@@ -238,6 +239,14 @@ JS_ONSITE.extend(
     ['js/srtwriter.js',
      'js/widget/samedomainembed.js',
      "js/widget/api/servermodel.js",
+     'js/widget/controls/bufferedbar.js',
+     'js/widget/controls/playpause.js',
+     'js/widget/controls/progressbar.js',
+     'js/widget/controls/progressslider.js',
+     'js/widget/controls/timespan.js',
+     'js/widget/controls/videocontrols.js',
+     'js/widget/controls/volumecontrol.js',
+     'js/widget/controls/volumeslider.js',
      "js/widget/api/api.js"])
 
 JS_WIDGETIZER_CORE = list(JS_CORE)
@@ -365,7 +374,6 @@ INSTALLED_APPS = (
     'django_extensions',
     'djcelery',
     'haystack',
-    'livesettings',
     'rosetta',
     'raven.contrib.django',
     'sorl.thumbnail',
@@ -378,7 +386,6 @@ INSTALLED_APPS = (
     # our apps
     'accountlinker',
     'comments',
-    'icanhaz',
     'messages',
     'profiles',
     'search',
@@ -523,7 +530,6 @@ RECAPTCHA_PUBLIC = '6LdoScUSAAAAANmmrD7ALuV6Gqncu0iJk7ks7jZ0'
 RECAPTCHA_SECRET = ' 6LdoScUSAAAAALvQj3aI1dRL9mHgh85Ks2xZH1qc'
 
 ROSETTA_EXCLUDED_APPLICATIONS = (
-    'livesettings',
     'openid_consumer',
     'rosetta'
 )
@@ -699,6 +705,7 @@ MEDIA_BUNDLES = {
               "js/jquery.rpc.js",
               "js/jquery.input_replacement.min.js",
               "js/messages.js",
+              "js/escape.js",
               "js/libs/chosen.jquery.min.js",
               "js/libs/chosen.ajax.jquery.js",
               "js/unisubs.site.js",
@@ -747,6 +754,41 @@ MEDIA_BUNDLES = {
          ),
         "include_js_base_dependencies": False,
         "include_flash_deps": False,
+    },
+    "embedder":{
+        "type":"js",
+        "optimizations": "SIMPLE_OPTIMIZATIONS",
+        "closure_deps": "",
+        "files": (
+            "src/js/third-party/json2.min.js",
+            'src/js/third-party/underscore.min.js',
+            'src/js/third-party/zepto.min.js',
+            'src/js/third-party/backbone.min.js',
+            'src/js/third-party/popcorn.js',
+            'src/js/embedder/popcorn.amaratranscript.js',
+            'src/js/embedder/popcorn.amarasubtitle.js',
+            'src/js/embedder/conf.js',
+            'src/js/embedder/embedder.js'
+        ),
+        "include_js_base_dependencies": False,
+        "include_flash_deps": False,
+        #"output": 'release/public/embedder.js',
+        "ignore_closure": True,
+        "release_url": True,
+        "bootloader": { 
+            "gatekeeper": "_amaraEmbedderLoaded", 
+        }
+
+    },
+    "embedder-css":{
+        "type":"css",
+        "files": (
+            "src/css/embedder/embedder-dev.css",
+        ),
+        "include_js_base_dependencies": False,
+        "include_flash_deps": False,
+        "output": 'release/public/embedder.css',
+        "release_url": True,
     },
     "debug-embed-js": {
         "type": "js",

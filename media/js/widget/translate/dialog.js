@@ -57,7 +57,6 @@ unisubs.translate.Dialog.State_ = {
     TRANSLATE: 0,
     EDIT_METADATA: 1
 };
-
 unisubs.translate.Dialog.prototype.createDom = function() {
     unisubs.translate.Dialog.superClass_.createDom.call(this);
     this.setDraggable(false);
@@ -173,11 +172,18 @@ unisubs.translate.Dialog.prototype.saveWorkInternal = function(closeAfterSave, s
     }
 
     if (goog.array.isEmpty(
-        this.serverModel_.captionSet_.nonblankSubtitles())){
-        // there are no subs here, close dialog or back to subtitling
-        this.showEmptySubsDialog();
+        this.serverModel_.captionSet_.nonblankSubtitles()) && !this.forceSave_){
+        this.alreadySaving_ = false;
+        if((this.captionSet_.hasTitleChanged() && this.captionSet_.originalTitle == "") ||
+             (this.captionSet_.hasDescriptionChanged() && this.captionSet_.originalDescription == "")){
+            this.showTitleDescriptionChangedDialog(closeAfterSave, saveForLater);
+        } else {
+            // there are no subs here, close dialog or back to subtitling
+            this.showEmptySubsDialog();
+        }
         return;
     }
+
     var that = this;
     this.getRightPanelInternal().showLoading(true);
     this.serverModel_.finish(
@@ -243,7 +249,7 @@ unisubs.translate.Dialog.prototype.setState_ = function(state) {
 
     var s = unisubs.translate.Dialog.State_;
 
-    this.setExtraClass_();
+    this.setExtraClass_(' the-translate-panel');
 
     var nextSubPanel = this.makeCurrentStateSubtitlePanel_();
     var captionPanel = this.getCaptioningAreaInternal();

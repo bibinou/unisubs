@@ -73,8 +73,8 @@
             {% endif %}
         </div>
 
-        {% if team|can_approve_application:user and team.applications.all.count > 0 %}
-            <p class="view-notice">{% trans 'This team has' %} <a href="{% url teams:applications slug=team.slug %}{% query_string request.GET %}">{{ team.applications.all.count }} {% trans 'open applications' %}</a></p>
+        {% if team|can_approve_application:user and team.applications.open.count > 0 %}
+            <p class="view-notice">{% trans 'This team has' %} <a href="{% url teams:applications slug=team.slug %}{% query_string request.GET %}">{{ team.applications.open.count }} {% trans 'open applications' %}</a></p>
         {% endif %}
 
 
@@ -106,11 +106,11 @@
                         <ul class="actions">
                             {% if member.user != user %}
                                 <li>
-                                    <a href="{% url messages:new %}?user={{ member.user.username }}">Send a message</a>
+                                    <a href="{% url messages:new %}?user={{ member.user.username|urlencode }}">Send a message</a>
                                 </li>
                             {% endif %}
                             <li>
-                                <a href="{% url teams:team_tasks team.slug %}?assignee={{ member.user.username }}">{% trans 'Assignments' %}</a>
+                                <a href="{% url teams:team_tasks team.slug %}?assignee={{ member.user.username|urlencode }}">{% trans 'Assignments' %}</a>
                             </li>
                         </ul>
                         {% if member in assignable_roles %}

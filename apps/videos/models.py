@@ -444,9 +444,8 @@ class Video(models.Model):
                 try:
                     assert video_url_obj.video == obj
                 except AssertionError, e:
-                    logger.error(
-                        "Data integrity error with video_url_obj with "
-                        "pk %d and video pk %d" % (video_url_obj.pk, obj.pk))
+                    logger.exception(
+                        "Data integrity error with video_url_obj ")
                     raise e
                 obj.update_search_index()
                 video, created = obj, True
@@ -710,18 +709,6 @@ class Video(models.Model):
         return [sl for sl in self.subtitlelanguage_set.all()
                 if sl.is_complete_and_synced(public_only=public_only)]
 
-    @property
-    def policy(self):
-
-        if not hasattr(self, "_cached_policy"):
-            from icanhaz.models import VideoVisibilityPolicy
-            try:
-                self._cached_policy =  VideoVisibilityPolicy.objects.get(video=self)
-            except VideoVisibilityPolicy.DoesNotExist:
-                self._cached_policy =  None
-        return self._cached_policy
-
-
     def get_title_display(self):
         """Return a suitable title to display to a user for this video.
 
@@ -765,6 +752,18 @@ class Video(models.Model):
 
         return meta
 
+    def can_user_see(self, user):
+        team_video = self.get_team_video()
+
+        if not team_video:
+            return True
+
+        team = team_video.team
+
+        if team and team.is_visible:
+            return True
+
+        return team.is_member(user)
 
     class Meta(object):
         permissions = (
@@ -1437,8 +1436,8 @@ class SubtitleVersion(SubtitleCollection):
         if standard_language:
             return standard_language.latest_version(public_only=public_only)
 
-    def ordered_subtitles(self):
-        subtitles = self.subtitles()
+    def ordered_subtitles(self, public_only=True):
+        subtitles = self.subtitles(public_only=True)
         subtitles.sort(key=lambda item: item.sub_order)
         return subtitles
 

@@ -21,10 +21,10 @@
             {% trans "Activity" %}
         </a>
     </li>
-    {% if team|can_view_settings_tab:user %}
-        <li{% if current == "settings" %} class="current" {% endif %}>
-            <a href="{% url teams:settings_basic slug=team.slug %}">
-                {% trans "Settings" %}
+    {% if team|is_team_member:user %}
+        <li{% if current == "tasks" %} class="current" {% endif %}>
+            <a href="{% url teams:team_tasks team.slug %}">
+                {% trans "Tasks" %}
             </a>
         </li>
     {% endif %}

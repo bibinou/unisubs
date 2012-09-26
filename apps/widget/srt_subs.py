@@ -17,7 +17,10 @@
 # http://www.gnu.org/licenses/agpl-3.0.html.
 """Functionality for generating srt files."""
 
+import xml.dom.minidom
 import StringIO
+from HTMLParser import HTMLParser
+from libs.unilangs import unilangs
 
 def captions_and_translations_to_srt(captions_and_translations):
     # TODO: note this loads the entire string into memory, which will not
@@ -148,6 +151,7 @@ class SRTSubtitles(BaseSubtitles):
     def __unicode__(self):
         output = []
 
+        parser = HTMLParser()
         i = 1
         for item in self.subtitles:
             if self.isnumber(item['start']) and self.isnumber(item['end']):
@@ -155,7 +159,7 @@ class SRTSubtitles(BaseSubtitles):
                 start = self.format_time(item['start'])
                 end = self.format_time(item['end'])
                 output.append(u'%s --> %s' % (start, end))
-                output.append(item['text'].strip())
+                output.append(parser.unescape(item['text']).strip())
                 output.append(u'')
                 i += 1
 
@@ -266,10 +270,23 @@ import re
 class TTMLSubtitles(BaseSubtitles):
     file_type = 'xml'
     remove_re = re.compile(u'[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]')
+    use_named_styles = True
+    STYLES = {
+
+        "strong": {
+            'fontWeight':'bold'
+        },
+        'emphasis': {
+            'textStyle': 'italic'
+        },
+        'underlined': {
+            'textDecoration': 'underline'
+        }
+    }
 
     def __unicode__(self):
-        return (u'<?xml version="1.0" encoding="UTF-8"?>%s' % self.line_delimiter)\
-            +etree.tounicode(self.xml_node(), pretty_print=True)
+        node = self.xml_node()
+        return node.toxml()
 
     def _get_attributes(self, item):
         attrib = {}
@@ -278,21 +295,57 @@ class TTMLSubtitles(BaseSubtitles):
         return attrib
 
     def xml_node(self):
-        tt = etree.Element('tt', nsmap={None: 'http://www.w3.org/2006/04/ttaf1', 'tts': 'http://www.w3.org/2006/04/ttaf1#styling'})
-        etree.SubElement(tt, 'head')
-        body = etree.SubElement(tt, 'body')
-        div = etree.SubElement(body, 'div')
-        for item in self.subtitles:
+        xmlt = """<tt xml:lang="%s" xmlns="http://www.w3.org/ns/ttml"
+                      xmlns:ttp="http://www.w3.org/ns/ttml#parameter"
+                      xmlns:tts="http://www.w3.org/ns/ttml#styling" >
+        <head>
+            <metadata/>
+            <styling/>
+            <layout/>
+        </head>
+        <body region="subtitleArea">
+            <div>
+            </div>
+        </body>
+        </tt>""" % unilangs.to_bcp47(self.sl.language)
+        from xml.dom import expatbuilder
+        dom = xml.dom.minidom.parseString(xmlt)
+	styling = dom.getElementsByTagName('head')[0].getElementsByTagName('styling')[0]
+        styling.setAttribute("xmlns:tts", "http://www.w3.org/2006/10/ttaf1#styling")
+
+        for style_name, style_def in TTMLSubtitles.STYLES.items():
+            style = dom.createElement('style')
+            style.setAttribute('xml:id', style_name)
+            for def_name, def_style in style_def.items():
+                style.setAttribute(def_name, def_style)
+            styling.appendChild(style)
+
+	div = dom.getElementsByTagName('tt')[0].getElementsByTagName('body')[0].getElementsByTagName('div')[0]
+        italic_declaration = 'tts:fontStyle="italic"' if TTMLSubtitles.use_named_styles else 'style="emphasis"'
+        bold_declaration = 'tts:fontWeight="bold"' if TTMLSubtitles.use_named_styles else 'style="strong"'
+        underline_declaration = 'tts:textDecoration="underline"' if TTMLSubtitles.use_named_styles else 'style="underlined"'
+            
+        for i,item in enumerate(self.subtitles):
             if item['text'] and self.isnumber(item['start']) and self.isnumber(item['end']):
-                attrib = self._get_attributes(item)
                 # as we're replacing new lines with <br>s we need to create
-                # the element from a fragment
-                p = lxml.html.fragment_fromstring(self.remove_re.sub(
-                    '', u"<p>%s</p>" %item['text'].replace('\n', '<br/>').strip()
-                ))
-                p.attrib.update(attrib)
-                div.append(p)
-        return tt
+                # the element from a fragment,and also from the formateed <b> and <i> to
+                # the correct span / style
+                content = item['text'].replace(u'\n', u'<br/>').strip()
+                content = content.replace(u"<b>", u'<span  %s>' % (bold_declaration)).replace(u"</b>", u'</span>')
+                content = content.replace(u"<i>", u'<span  %s>' % (italic_declaration)).replace(u"</i>", u'</span>')
+                content = content.replace(u"<u>", u'<span  %s>' % (underline_declaration)).replace(u"</u>", u'</span>')
+                xml_str = (u'<p xml:id="sub-%s">%s</p>' % (i,content)).encode('utf-8')
+        
+                # we need to use this parser to make sure namespace chekcing is off
+                # else the node can't be generated without the proper context
+                node = expatbuilder.parseString(xml_str, namespaces=False)
+                child = node.documentElement
+
+                for k,v in self._get_attributes(item).items():
+                    child.setAttribute(k,v)
+                div.appendChild(child)
+
+        return dom
 
     def format_time(self, time):
         hours = int(floor(time / 3600))

@@ -43,8 +43,8 @@ def _generate_youtube_oauth_request_link(state_str=None):
     
     params = {
         "client_id": settings.YOUTUBE_CLIENT_ID,
-        "redirect_uri": 
-            universal_url("accountlinker:youtube-oauth-callback"),
+        "redirect_uri":  "https://%s%s" % (Site.objects.get_current().domain, 
+            reverse("accountlinker:youtube-oauth-callback")),
         "scope": "https://gdata.youtube.com",
         "state": state,
         "response_type": "code",
@@ -75,10 +75,13 @@ def youtube_oauth_callback(request):
     base =  "https://accounts.google.com/o/oauth2/token"
     state = team.pk
     
+    # When testing this locally, sometimes you will have to remove the https
+    # override.
     params = {
         "client_id": settings.YOUTUBE_CLIENT_ID,
         "client_secret": settings.YOUTUBE_CLIENT_SECRET,
-        "redirect_uri": universal_url("accountlinker:youtube-oauth-callback"),
+        "redirect_uri": universal_url("accountlinker:youtube-oauth-callback",
+            protocol_override='https'),
         "code": code,
         "grant_type": "authorization_code",
         
@@ -92,6 +95,7 @@ def youtube_oauth_callback(request):
                     "data": {
                         "sent_params": params,
                         "original_request": request,
+                        "response": response.content
                     },
                 })
                     

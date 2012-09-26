@@ -57,9 +57,8 @@ from django.utils.http import urlquote_plus
 from videos.tasks import video_changed_tasks
 from videos.search_indexes import VideoIndex
 import datetime
-from icanhaz.models import VideoVisibilityPolicy
 from videos.decorators import get_video_revision, get_video_from_code
-
+from apps.teams.models import Task
 
 rpc_router = RpcRouter('videos:rpc_router', {
     'VideosApi': VideosApiClass()
@@ -213,7 +212,7 @@ def video(request, video, video_url=None, title=None):
     context['video'] = video
     context['autosub'] = 'true' if request.GET.get('autosub', False) else 'false'
     context['translations'] = _get_translations(video)
-    context['shows_widget_sharing'] = VideoVisibilityPolicy.objects.can_show_widget(video, request.META.get('HTTP_REFERER', ''))
+    context['shows_widget_sharing'] = video.can_user_see(request.user)
 
     context['widget_params'] = _widget_params(
         request, video, language=None,
@@ -237,7 +236,6 @@ def _get_related_task(request):
     """
     task_pk = request.GET.get('t', None)
     if task_pk:
-        from teams.models import Task
         from teams.permissions import can_perform_task
         try:
             task = Task.objects.get(pk=task_pk)
@@ -322,17 +320,6 @@ def feedback(request, hide_captcha=False):
     else:
         output['errors'] = form.get_errors()
     return HttpResponse(json.dumps(output), "text/javascript")
-
-def site_feedback(request):
-    text = request.GET.get('text', '')
-    email = ''
-    if request.user.is_authenticated():
-        email = request.user.email
-    initial = dict(message=text, email=email)
-    form = FeedbackForm(initial=initial)
-    return render_to_response(
-        'videos/site_feedback.html', {'form':form},
-        context_instance=RequestContext(request))
 
 def email_friend(request):
     text = request.GET.get('text', '')
@@ -444,7 +431,7 @@ def history(request, video, lang=None, lang_id=None, version_id=None):
     context['widget_params'] = _widget_params(request, video, version_no=None, language=language, size=(620,370))
     context['language'] = language
     context['edit_url'] = language.get_widget_url()
-    context['shows_widget_sharing'] = VideoVisibilityPolicy.objects.can_show_widget(video, request.META.get('HTTP_REFERER', ''))
+    context['shows_widget_sharing'] = video.can_user_see(request.user)
 
     context['task'] =  _get_related_task(request)
     _add_share_panel_context_for_history(context, video, language)
@@ -523,7 +510,7 @@ def diffing(request, first_version, second_pk):
         # this is either a bad bug, or someone evil
         raise "Revisions for diff videos"
     video = first_version.language.video
-    if second_version.datetime_started > first_version.datetime_started:
+    if second_version.version_no > first_version.version_no:
         first_version, second_version = second_version, first_version
 
     second_captions = dict([(item.subtitle_id, item) for item in second_version.ordered_subtitles()])
@@ -690,6 +677,18 @@ def video_url_create(request):
 
     return HttpResponse(json.dumps(output))
 
+@staff_member_required
+def reindex_video(request, video_id):
+    from teams.tasks import update_one_team_video
+
+    video = get_object_or_404(Video, video_id=video_id)
+    video.update_search_index()
+
+    team_video = video.get_team_video()
+
+    if team_video:
+        update_one_team_video.delay(team_video.id)
+
 def subscribe_to_updates(request):
     email_address = request.POST.get('email_address', '')
     data = urllib.urlencode({'email': email_address})
@@ -720,6 +719,9 @@ def video_debug(request, video_id):
     from apps.testhelpers.views import debug_video
     from apps.widget import video_cache as vc
     from django.core.cache import cache
+    from accountlinker.models import youtube_sync
+    from videos.models import VIDEO_TYPE_YOUTUBE
+
     video = get_object_or_404(Video, video_id=video_id)
     lang_info = debug_video(video)
     vid = video.video_id
@@ -735,9 +737,21 @@ def video_debug(request, video_id):
         "get_video_languages_verbose": cache.get(vc._video_languages_verbose_key(vid)),
         "writelocked_langs": cache.get(vc._video_writelocked_langs_key(vid)),
     }
+    tasks = Task.objects.filter(team_video=video)
+
+    is_youtube = video.videourl_set.filter(type=VIDEO_TYPE_YOUTUBE).count() != 0
+
+    if request.method == 'POST' and request.POST.get('action') == 'sync':
+        # Sync video to youtube
+        sync_lang = SubtitleLanguage.objects.get(
+                pk=request.POST.get('language'))
+        youtube_sync(video, sync_lang)
+
     return render_to_response("videos/video_debug.html", {
-            'video':video,
+            'video': video,
+            'is_youtube': is_youtube,
             'lang_info': lang_info,
+            'tasks': tasks,
             "cache": cache
     }, context_instance=RequestContext(request))
 

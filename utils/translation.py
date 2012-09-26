@@ -118,6 +118,16 @@ def languages_with_labels(langs):
 
 
 def is_rtl(lang):
+    # there are languages on our system that are not on django.
+    # so, let's find and return the right value here:
+    if lang in ('arq', 'pnb',):
+        return True
+
+    # Forcing Azerbaijani to be a left-to-right language.
+    # For: https://unisubs.sifterapp.com/projects/12298/issues/753035/comments 
+    if lang == 'az':
+        return False
+
     try:
         return get_language_info(lang)['bidi']
     except KeyError:

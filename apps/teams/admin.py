@@ -18,13 +18,15 @@
 
 from django import forms
 from django.contrib import admin
+from django.contrib import messages as django_messages
 from django.core.urlresolvers import reverse
 from django.utils.translation import ugettext_lazy as _
 
 from messages.forms import TeamAdminPageMessageForm
 from teams.models import (
     Team, TeamMember, TeamVideo, Workflow, Task, Setting, MembershipNarrowing,
-    Project, TeamLanguagePreference, TeamNotificationSetting
+    Project, TeamLanguagePreference, TeamNotificationSetting, BillingReport,
+    Partner, Application, ApplicationInvalidException, Invite
 )
 from videos.models import SubtitleLanguage
 
@@ -35,7 +37,8 @@ class TeamMemberInline(admin.TabularInline):
 
 class TeamAdmin(admin.ModelAdmin):
     search_fields = ('name'),
-    list_display = ('name', 'membership_policy', 'video_policy', 'is_visible', 'highlight', 'last_notification_time', 'thumbnail')
+    list_display = ('name', 'membership_policy', 'video_policy', 'is_visible',
+            'highlight', 'last_notification_time', 'thumbnail', 'partner')
     list_filter = ('highlight', 'is_visible')
     actions = ['highlight', 'unhighlight', 'send_message']
     raw_id_fields = ['video', 'users', 'videos', 'applicants']
@@ -84,21 +87,6 @@ class TeamMemberAdmin(admin.ModelAdmin):
     user_link.short_description = _('User')
     user_link.allow_tags = True
 
-class TeamVideoForm(forms.ModelForm):
-
-    class Meta:
-        model = TeamVideo
-
-    def __init__(self, *args, **kwargs):
-        super(TeamVideoForm, self).__init__(*args, **kwargs)
-
-        if self.instance and self.instance.pk:
-            qs = SubtitleLanguage.objects.filter(video=self.instance.video)
-        else:
-            qs = SubtitleLanguage.objects.none()
-
-        self.fields['completed_languages'].queryset = qs
-
 class TeamVideoAdmin(admin.ModelAdmin):
     list_display = ('__unicode__', 'team_link', 'created')
     readonly_fields = ('completed_languages',)
@@ -128,13 +116,15 @@ class TaskAdmin(admin.ModelAdmin):
     #    for some reason.
     # 2. It's only a few extra queries, so it's not the end of the world.
     list_display = ('id', 'type', 'team_title', 'team_video_title',
-                    'language_title', 'assignee_name', 'is_complete', 'deleted')
+                    'language_title', 'assignee_name', 'is_complete', 'deleted', 'created')
     list_filter = ('type', 'deleted', 'created', 'modified', 'completed')
     search_fields = ('assignee__username', 'team__name', 'assignee__first_name',
                      'assignee__last_name', 'team_video__title',
                      'team_video__video__title')
     raw_id_fields = ('team_video', 'team', 'assignee', 'subtitle_version',
                      'review_base_version')
+
+    readonly_fields = ('created', 'modified')
     ordering = ('-id',)
     list_per_page = 20
 
@@ -192,6 +182,45 @@ class ProjectAdmin(admin.ModelAdmin):
     ordering = ('-created',)
 
 
+class BillingReportAdmin(admin.ModelAdmin):
+    list_display = ('team', 'start_date', 'end_date', 'processed')
+
+
+class InviteAdmin(admin.ModelAdmin):
+    list_display = ('user', 'team', 'role', 'approved',)
+
+
+class ApplicationAdmin(admin.ModelAdmin):
+    search_fields = ('user__username', 'team__name', 'user__first_name', 'user__last_name')
+    list_display = ('user',  'team_link', 'user_link', 'created', 'status')
+    list_filter = ('status', )
+    raw_id_fields = ('user', 'team')
+    ordering = ('-created',)
+
+    def team_link(self, obj):
+        url = reverse('admin:teams_team_change', args=[obj.team_id])
+        return u'<a href="%s">%s</a>' % (url, obj.team)
+    team_link.short_description = _('Team')
+    team_link.allow_tags = True
+
+    def user_link(self, obj):
+        url = reverse('admin:auth_customuser_change', args=[obj.user_id])
+        return u'<a href="%s">%s</a>' % (url, obj.user)
+    user_link.short_description = _('User')
+    user_link.allow_tags = True
+
+    def save_model(self, request, obj, form, change):
+        obj.user = request.user
+        try:
+            if form.cleaned_data['status'] == Application.STATUS_APPROVED:
+                obj.approve()
+            elif form.cleaned_data['status'] == Application.STATUS_DENIED:
+                obj.deny()
+            else:
+                obj.save()
+        except ApplicationInvalidException:
+           django_messages.error(request, 'Not saved! Status already in use %s' )
+
 admin.site.register(TeamMember, TeamMemberAdmin)
 admin.site.register(Team, TeamAdmin)
 admin.site.register(TeamVideo, TeamVideoAdmin)
@@ -202,3 +231,7 @@ admin.site.register(MembershipNarrowing, MembershipNarrowingAdmin)
 admin.site.register(Setting, SettingAdmin)
 admin.site.register(Project, ProjectAdmin)
 admin.site.register(TeamNotificationSetting)
+admin.site.register(BillingReport, BillingReportAdmin)
+admin.site.register(Partner)
+admin.site.register(Invite, InviteAdmin)
+admin.site.register(Application, ApplicationAdmin)

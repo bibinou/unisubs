@@ -197,7 +197,7 @@ def _create_env(username, hosts, hostnames_squid_cache, s3_bucket,
     env.user = username
     env.web_hosts = hosts
     env.hosts = []
-    env.deploy_lock = '/tmp/.unisubs_deploy'
+    env.deploy_lock = '/tmp/.unisubs_deploy_{0}'.format(git_branch)
     env.hostnames_squid_cache = hostnames_squid_cache
     env.s3_bucket = s3_bucket
     env.web_dir = web_dir or '/var/www/{0}'.format(installation_dir)
@@ -629,7 +629,7 @@ def update_integration():
     with Output("Updating nested unisubs-integration repositories"):
         _execute_on_all_hosts(_update_integration)
 
-def _notify(subj, msg, audience='ehazlett@pculture.org'):
+def _notify(subj, msg, audience='sysadmin@pculture.org ehazlett@pculture.org'):
     mail_from_host = 'pcf-us-dev.pculture.org:2191'
 
     old_host = env.host_string

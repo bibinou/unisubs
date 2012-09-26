@@ -98,7 +98,7 @@ unisubs.subtitle.Dialog.prototype.showDownloadLink_ = function() {
     var that = this;
     this.getRightPanelInternal().showDownloadLink(
         function() {
-            return that.captionSet_.makeJsonSubs();
+            return that.makeJsonSubs();
         });
 };
 unisubs.subtitle.Dialog.prototype.enterDocument = function() {
@@ -132,10 +132,10 @@ unisubs.subtitle.Dialog.prototype.enterDocument = function() {
     }
 
 };
-unisubs.subtitle.Dialog.prototype.setExtraClass_ = function() {
+unisubs.subtitle.Dialog.prototype.setExtraClass_ = function(extraClass) {
     var extraClasses = goog.array.map(
         ['transcribe', 'sync', 'review', 'finished'],
-        function(suffix) { return 'unisubs-modal-widget-' + suffix; });
+        function(suffix) { return 'unisubs-modal-widget-' + suffix + (extraClass || ''); });
     var currentClass = "";
     var s = unisubs.subtitle.Dialog.State_;
     if (this.state_ == s.TRANSCRIBE)
@@ -315,23 +315,34 @@ unisubs.subtitle.Dialog.prototype.handleDoneKeyPress_ = function(event) {
     if (this.state_ == unisubs.subtitle.Dialog.State_.REVIEW) {
 
         // Make sure this subtitle set has captions.
-        if (this.captionSet_.captions_.length === 0) {
-            alert('You must create captions in order to submit.');
-            return false;
-        } else {
-
-            var halt = false;
-
-            // If there are captions, make sure each captions has timing data.
-            goog.array.forEach(this.captionSet_.captions_, function(c) {
-                if (c.getStartTime() === -1 || c.getEndTime() === -1) {
-                    halt = true;
-                }
-            });
-
-            if (halt === true) {
-                alert('You have unsynced captions. You must sync all captions before you can submit.');
+        if((this.captionSet_.captions_.length === 0) && 
+            !(this.captionSet_.hasTitleChanged() && this.captionSet_.originalTitle == "") &&
+                 !(this.captionSet_.hasDescriptionChanged() && this.captionSet_.originalDescription == "")){
+                alert('You must create captions in order to submit.');
                 return false;
+        } else {
+            if (this.captionSet_.needsSync()) {
+                alert("You have unsynced captions. Please make sure that all lines, including the last one, have start and end time set properly before submitting subtitles. HINT: Use the up arrow to set a caption's end time");
+                return false;
+            }
+
+            // We are satisifed with the start and end times of all captions.
+            //
+            // However, if the last caption has no end time, set it to either a) the duration of the video or b) the start time
+            // of the caption + 4 seconds.
+            if (this.captionSet_.captions_[this.captionSet_.captions_.length -1].getEndTime() ==
+                    unisubs.subtitle.EditableCaption.TIME_UNDEFINED) {
+
+                var cap = this.captionSet_.captions_[this.captionSet_.captions_.length -1];
+
+                var newEndTime;
+                if (this.videoPlayer_.getDuration()) {
+                    newEndTime = Math.min(this.videoPlayer_.getDuration(), cap.getStartTime() + 4.0);
+                } else {
+                    newEndTime = cap.getStartTime() + 4.0;
+                }
+
+                cap.setEndTime(newEndTime);
             }
         }
 
@@ -363,10 +374,15 @@ unisubs.subtitle.Dialog.prototype.saveWorkInternal = function(closeAfterSave, sa
     if (this.captionSet_.needsSync()) {
         this.saveWorkImpl_(closeAfterSave, saveForLater, false);
     } else if (goog.array.isEmpty(
-        this.serverModel_.captionSet_.nonblankSubtitles())){
-        // there are no subs here, close dialog or back to subtitling
+        this.serverModel_.captionSet_.nonblankSubtitles()) && !this.forceSave_){
         this.alreadySaving_ = false;
-        this.showEmptySubsDialog();
+        if((this.captionSet_.hasTitleChanged() && this.captionSet_.originalTitle == "") ||
+             (this.captionSet_.hasDescriptionChanged() && this.captionSet_.originalDescription == "")){
+            this.showTitleDescriptionChangedDialog(closeAfterSave, saveForLater);
+        } else {
+            // there are no subs here, close dialog or back to subtitling
+            this.showEmptySubsDialog();
+        }
         return;
     } else {
         unisubs.subtitle.CompletedDialog.show(

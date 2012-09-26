@@ -30,7 +30,7 @@ from apps.messages.models import Message
 from apps.messages import tasks as notifier
 
 from teams.models import Team, TeamMember, Application, Workflow,\
-     TeamVideo, Task
+     TeamVideo, Task, Setting, Invite
 from teams.forms import InviteForm
 from videos.models import Action, Video, SubtitleVersion, SubtitleLanguage, \
      Subtitle
@@ -398,3 +398,92 @@ class MessageTest(TestCase):
         m = mail.outbox[0]
         self.assertTrue(to_user.email in m.to)
         
+
+    def test_messages_remain_after_team_membership(self):
+        # Here's the scenario:
+        # User is invited to a team
+        # - User accepts invitation
+        # - Message for the invitation gets deleted -> wrong!
+        user = User.objects.filter(notify_by_message=True)[0]
+        owner = User.objects.filter(notify_by_message=True)[1]
+        team = Team.objects.create(name='test-team', slug='test-team', membership_policy=Team.APPLICATION)
+
+        invite_form = InviteForm(team, owner, {
+            'user_id': user.pk,
+            'message': 'Subtitle ALL the things!',
+            'role':'contributor',
+        })
+        invite_form.is_valid()
+        self.assertFalse(invite_form.errors)
+        self.assertEquals(Message.objects.for_user(user).count(), 0)
+        invite = invite_form.save()
+        # user has the invitation message on their inbox now
+        self.assertEquals(Message.objects.for_user(user).count(), 1)
+        invite_message = Message.objects.for_user(user)[0]
+        # now user accepts invite
+        invite.accept()
+        # he should be a team memebr
+        self.assertTrue(team.members.filter(user=user).exists())
+        # message should be still on their inbos
+        self.assertIn(invite_message, Message.objects.for_user(user))
+
+
+class TeamBlockSettingsTest(TestCase):
+    fixtures = ["staging_users.json", "staging_videos.json", "staging_teams.json"]
+
+    def test_block_settings_for_team(self):
+        from teams.models import Team, Setting, Invite, Application
+        from messages import tasks as n
+        from teams import tasks as team_tasks
+        team_video = TeamVideo.objects.all()[0]
+        team = team_video.team
+        #team , created  = Team.objects.get_or_create(name='test', slug='test')
+        user = User.objects.all()[0]
+        user.notify_by_email = True
+        user.save()
+        owner = User.objects.all()[2]
+        owner.notify_by_email = owner.notify_by_message = True
+        owner.save()
+        TeamMember.objects.get_or_create(team=team, user=owner, role=TeamMember.ROLE_OWNER)
+        invite = Invite.objects.get_or_create(team=team, user=user, author=User.objects.all()[1])[0]
+        member = TeamMember.objects.create(team=team, user=user)
+        team_video = TeamVideo.objects.filter(team=team)[0]
+        task_assigned = Task.objects.create(team=team, team_video=team_video, type=10, assignee=member.user)
+        sv = SubtitleVersion.objects.all()[0]
+        language = team_video.video.subtitlelanguage_set.all()[0]
+        language.language = 'en'
+        language.save()
+        sv.language = language
+        sv.save()
+        task_with_version = Task.objects.create(team=team, team_video=team_video, type=10, assignee=member.user,
+                                                subtitle_version=sv, language='en')
+
+        to_test = (
+            ("block_invitation_sent_message", n.team_invitation_sent, (invite.pk,)),
+            ("block_application_sent_message", n.application_sent, (Application.objects.get_or_create(team=team, note='', user=user)[0].pk, )),
+            ("block_application_denided_message", n.team_application_denied, (Application.objects.get_or_create(team=team, note='', user=user)[0].pk, )),
+            ("block_team_member_new_message", n.team_member_new, (member.pk, )),
+            ("block_team_member_leave_message", n.team_member_leave, (team.pk,member.user.pk )),
+            ("block_task_assigned_message", n.team_task_assigned, (task_assigned.pk,)),
+            ("block_reviewed_and_published_message", n.reviewed_and_published, (task_with_version.pk,)),
+            ("block_reviewed_and_pending_approval_message", n.reviewed_and_pending_approval, (task_with_version.pk,)),
+            ("block_reviewed_and_sent_back_message", n.reviewed_and_sent_back, (task_with_version.pk,)),
+            ("block_approved_message", n.approved_notification, (task_with_version.pk,)),
+
+        )
+        for setting_name, function, args in to_test:
+            team.settings.all().delete()
+            Message.objects.all().delete()
+            if setting_name == 'block_application_sent_message':
+                pass
+            function.run(*args)
+            self.assertTrue(Message.objects.count() > 0, "%s is off, so this message should be sent" % setting_name)
+            Setting.objects.create(team=team, key=Setting.KEY_IDS[setting_name])
+            Message.objects.all().delete()
+            function.run(*args)
+            self.assertEquals(Message.objects.all().count() , 0, "%s is on, so this message should *not * be sent" % setting_name)
+        # add videos notification is a bit different
+        setting_name = "block_new_video_message"
+        Setting.objects.create(team=team, key=Setting.KEY_IDS[setting_name])
+        team_tasks.add_videos_notification()
+        self.assertEquals(Message.objects.all().count() , 0, "%s is on, so this message should *not * be sent" % setting_name)

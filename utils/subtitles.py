@@ -17,6 +17,7 @@
 # http://www.gnu.org/licenses/agpl-3.0.html.
 import random
 import re
+from itertools import chain
 from datetime import datetime
 from uuid import uuid4
 from xml.dom.minidom import parseString
@@ -59,13 +60,14 @@ def strip_tags(text, tags=None):
     """
     if tags is None:
         tags = DEFAULT_ALLOWED_TAGS
+    if text is None:
+        return ""
     return bleach.clean(text, tags=tags, strip=True)
     
 def save_subtitle(video, language, parser, user=None, update_video=True,
                   forks=True, as_forked=True, translated_from=None):
     from videos.models import SubtitleVersion, Subtitle, SubtitleMetadata
     from videos.tasks import video_changed_tasks
-    from utils.unisubsmarkup import strip_tags
 
     key = str(uuid4()).replace('-', '')
 
@@ -153,6 +155,24 @@ def save_subtitle(video, language, parser, user=None, update_video=True,
 
     return language
 
+
+MULTIPLE_SPACES = re.compile('\s{2,}')
+BLANK_CHARS = re.compile('[\n\t\r]*')
+def from_xmlish_text(input_str):
+    """
+    Parses text content from xml based formats.
+    <br> tags are transformed into newlines, tab and multiple spaces
+    collapsed. e.g. turns:
+    "\n\r foo  <br/> bar foorer \t " -> "foo bar\nfoorer"
+    """
+    if not input_str:
+        return u""
+    # remove new lines and tabs
+    input_str = BLANK_CHARS.sub(u"", input_str)
+    # do convert <br> to new lines
+    input_str = input_str.replace("<br/>", "\n")
+    # collapse whitespace on each new line
+    return "\n".join( MULTIPLE_SPACES.sub(u" ", x).strip() for x in input_str.split('\n'))
 
 class SubtitleParserError(Exception):
     pass
@@ -315,6 +335,7 @@ class STSubtitleParser(SubtitleParser):
         except (ExpatError, IndexError):
             raise SubtitleParserError('Incorrect format of SpeakerText subtitles')
 
+
     def __len__(self):
         return len(self.nodes)
 
@@ -341,14 +362,46 @@ class STSubtitleParser(SubtitleParser):
         for item in self.nodes:
             yield self._get_data(item)
 
+def generate_style_map(dom):
+    '''
+    Parse the head.styling node on the xml and generate a hash -> list
+    of styles that require our supported formatting optins (bold and
+    italic for now).
+    eg.
+    style_map = {
+        'italic': ['speaker', 'importante'],
+        'bold': [],
+    }
+    This will be used when parsing each text node to make sure
+    we can convert to our own styling markers.
+    '''
+    style_map = {
+        'italic': [],
+        'bold': [],
+    }
+    styling_nodes = dom.getElementsByTagName("styling")
+    style_nodes = chain.from_iterable([x.getElementsByTagName('style') for x in styling_nodes])
+    for style_node in style_nodes:
+        style_id = style_node.getAttribute('xml:id')
+        for key in style_node.attributes.keys():
+            value  = style_node.attributes[key].value
+            if key  == 'tts:fontWeight' and  value == 'bold':
+                style_map['bold'].append(style_id)
+            elif key  == 'tts:fontStyle' and value == 'italic':
+                style_map['italic'].append(style_id)
+    return style_map
+ 
 class TtmlSubtitleParser(SubtitleParser):
 
     def __init__(self, subtitles):
         try:
-            dom = parseString(subtitles.encode('utf8'))
+            # do not pass utf-8 econded strings. If the xml declaration is
+            # something else, the parser will complain otherwise
+            dom = parseString(subtitles)
             self.nodes = dom.getElementsByTagName('body')[0].getElementsByTagName('p')
         except (ExpatError, IndexError):
             raise SubtitleParserError('Incorrect format of TTML subtitles')
+                       
 
     def __len__(self):
         return len(self.nodes)
@@ -356,7 +409,7 @@ class TtmlSubtitleParser(SubtitleParser):
     def __nonzero__(self):
         return bool(len(self.nodes))
 
-    def _get_time(self, begin, dur):
+    def _get_time(self, begin, dur, is_duration=True):
         if not begin or not dur:
             return -1
 
@@ -368,18 +421,26 @@ class TtmlSubtitleParser(SubtitleParser):
                 return -1
 
             d_hour, d_min, d_sec = dur.split(':')
-            end = start + int(d_hour)*60*60 + int(d_min)*60 + float(d_sec)
+            end =  + int(d_hour)*60*60 + int(d_min)*60 + float(d_sec)
+            if is_duration:
+                end += start
         except ValueError:
             return -1
 
         return start, end
 
     def _get_data(self, node):
+        from utils.unisubsmarkup import html_to_markup
+
         output = {
-            'subtitle_text': unescape_html(strip_tags(node.toxml()))
+            'subtitle_text': unescape_html(html_to_markup(from_xmlish_text(node.toxml())))
         }
-        output['start_time'], output['end_time'] = \
-            self._get_time(node.getAttribute('begin'), node.getAttribute('dur'))
+        if node.hasAttribute('dur'):
+            output['start_time'], output['end_time'] = \
+                self._get_time(node.getAttribute('begin'), node.getAttribute('dur'))
+        else:
+            output['start_time'], output['end_time'] = \
+                self._get_time(node.getAttribute('begin'), node.getAttribute('end'), False)
         return output
 
     def _result_iter(self):
@@ -390,7 +451,18 @@ class DfxpSubtitleParser(SubtitleParser):
 
     def __init__(self, subtitles):
         try:
-            dom = parseString(subtitles.encode('utf8'))
+            # do not pass utf-8 econded strings. If the xml declaration is
+            # something else, the parser will complain otherwise
+            dom = parseString(subtitles)
+            self.style_map = generate_style_map(dom)
+            t = dom.getElementsByTagName('tt')[0]
+            
+            self.tickRate = 0;
+            
+            for attr in t.attributes.values():
+                if attr.localName == "tickRate":
+                    self.tickRate = int(attr.value)
+                        
             self.nodes = dom.getElementsByTagName('body')[0].getElementsByTagName('p')
         except (ExpatError, IndexError):
             raise SubtitleParserError('Incorrect format of TTML subtitles')
@@ -403,19 +475,59 @@ class DfxpSubtitleParser(SubtitleParser):
 
     def _get_time(self, t):
         try:
-            hour, min, sec = t.split(':')
-
-            start = int(hour)*60*60 + int(min)*60 + float(sec)
-            if start > MAX_SUB_TIME:
-                return -1
+            if t.endswith('t'):
+                ticks = int(t.split('t')[0])
+            
+                start = ticks / float(self.tickRate)
+            
+            else:
+                hour, min, sec = t.split(':')
+            
+                start = int(hour)*60*60 + int(min)*60 + float(sec)
+                if start > MAX_SUB_TIME:
+                    return -1
         except ValueError:
             return -1
 
         return start
 
+    def _replace_els(self, node, attrname, attrvalue, tagname):
+        """
+        Edits the node in place, changing <span:[attrname]=[attrvalue]>x</span> to 
+        <[tagname]>x</tagname>
+        This is needed because in order to store the markkup like
+        format we use internally, we need to convert the dfxp specific
+        tags to the regural htmlishy tags we use.
+        """
+        els = [x for x in node.childNodes if hasattr(x, 'tagName') and x.tagName == 'span' and x.getAttribute(attrname) == attrvalue]
+        for x  in els:
+            x.tagName = tagname
+            # if you have text like <i>hey, </i><span>you</span>, the markdown processor
+            # will get confused (it needs to see *hey,* , not *hey, * .
+            # this ugly hack shifts the space to the beginning of the next node. will probably
+            # break under various other edge cases. Ideas?
+            if x.firstChild and len(x.firstChild.nodeValue.rstrip()) != x.firstChild.nodeValue and x.nextSibling:
+                x.firstChild.nodeValue = x.firstChild.nodeValue.rstrip()
+                if x.nextSibling and x.nextSibling.firstChild and not x.nextSibling.firstChild.nodeValue.startswith(" "):
+                    x.nextSibling.firstChild.nodeValue = " " + x.nextSibling.firstChild.nodeValue
+            x.removeAttribute(attrname)
+
     def _get_data(self, node):
+        from utils.unisubsmarkup import html_to_markup
+        # replace inline styles to our markdown format, e.g.
+        # <span fontWeith='bold'> -> **
+        self._replace_els(node, 'tts:fontStyle', 'italic', 'i')
+        self._replace_els(node, 'tts:fontWeight', 'bold', 'b')
+        # now look at names styles. go over the style map for this
+        # data and if the style matches one of ours, replace it
+        for style_name in self.style_map['bold']:
+            self._replace_els(node, 'style', style_name, 'b')
+        for style_name in self.style_map['italic']:
+            self._replace_els(node, 'style', style_name, 'i')
+            
+
         output = {
-            'subtitle_text': unescape_html(strip_tags(node.toxml().replace("<br/>", "\n")))
+            'subtitle_text': unescape_html(html_to_markup(from_xmlish_text(node.toxml())))
         }
         output['start_time'] = self._get_time(node.getAttribute('begin'))
         output['end_time'] = self._get_time(node.getAttribute('end'))
@@ -437,7 +549,7 @@ class SrtSubtitleParser(SubtitleParser):
         pattern += r'\n(\n|(?P<text>.+?)\n\n)'
         super(SrtSubtitleParser, self).__init__(subtitles, pattern, [re.DOTALL])
         #replace \r\n to \n and fix end of last subtitle
-        self.subtitles = self.subtitles.replace('\r\n', '\n')+u'\n\n'
+        self.subtitles = self.subtitles.replace('\r\n', '\n')+'\n\n'
 
     def _get_time(self, hour, min, sec, secfr):
         if secfr is None:
@@ -481,7 +593,7 @@ class SsaSubtitleParser(SrtSubtitleParser):
 
 ParserList.register(SrtSubtitleParser, 'srt')
 ParserList.register(SsaSubtitleParser, ['ssa', 'ass'])
-ParserList.register(TtmlSubtitleParser, 'xml')
+ParserList.register(TtmlSubtitleParser, ['xml', 'ttml'])
 ParserList.register(SbvSubtitleParser, 'sbv')
 ParserList.register(DfxpSubtitleParser, 'dfxp')
 ParserList.register(TxtSubtitleParser, 'txt')
