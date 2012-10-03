@@ -1,17 +1,19 @@
 {% if task.get_type_display == "Subtitle" or task.get_type_display == "Translate"%}
 <script type="text/javascript">
 $('.perform-task-{{ task.pk }}').click(function() {
-    var videoSource = unisubs.player.MediaSource.videoSourceForURL('{{ task.cached_video_url }}');
-    var opener = new unisubs.widget.SubtitleDialogOpener(
-        '{{ task.team_video.video.video_id }}',
-        '{{ task.cached_video_url|safe }}',
-        videoSource, null, null, 'fr'
-    );
-    {% if task.language %}
+    site.Utils.assignTask({{ task.pk }}, function(){    
+        var videoSource = unisubs.player.MediaSource.videoSourceForURL('{{ task.cached_video_url }}');
+        var opener = new unisubs.widget.SubtitleDialogOpener(
+            '{{ task.team_video.video.video_id }}',
+            '{{ task.cached_video_url|safe }}',
+            videoSource, null, null, 'fr'
+        );
+        {% if task.language %}
         opener.showStartDialog(null, {'LANGUAGE': '{{ task.language }}', 'FORCE': true});
-    {% else %}
+        {% else %}
         opener.showStartDialog();
-    {% endif %}
+        {% endif %}
+    });
 
     return false;
 });
@@ -21,23 +23,10 @@ $('.perform-task-{{ task.pk }}').click(function() {
 $('.perform-task-{{ task.pk }}').click(function(e) {
     var $link = $(e.target);
     $link.text('Loading...');
-
-    $.ajax({
-        url: window.ASSIGN_TASK_AJAX_URL,
-        type: 'POST',
-        data: {
-            task: {{ task.pk }},
-            assignee: window.ASSIGNEE
-        },
-        success: function(data, textStatus, jqXHR) {
-            var $link = $(e.target);
-
-            if ($link.attr('href') !== '') {
-                window.location = $link.attr('href');
-            } else {
-                $link.click();
-            }
-        }
+        
+    site.Utils.assignTask({{ task.pk }}, function(){
+        window.location = $link.attr('href');
+        $link.click();
     });
 
     return false;
