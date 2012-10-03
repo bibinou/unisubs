@@ -1135,6 +1135,16 @@ def _get_task_filters(request):
              'assignee': request.GET.get('assignee'),
              'q': request.GET.get('q'), }
 
+def _cache_video_url(tasks):
+    team_video_pks = [t.team_video_id for t in tasks]
+    video_pks = Video.objects.filter(teamvideo__in=team_video_pks).values_list('id', flat=True)
+
+    video_urls = dict([(vu.video_id, vu.effective_url) for vu in
+                       VideoUrl.objects.filter(video__in=video_pks, primary=True)])
+
+    for t in tasks:
+        t.cached_video_url = video_urls.get(t.team_video.video_id)
+
 @timefn
 @render_to('teams/dashboard.html')
 def dashboard(request, slug):
@@ -1144,12 +1154,11 @@ def dashboard(request, slug):
     user = request.user if request.user.is_authenticated() else None
     member = team.members.get(user=user) if user else None
 
-    filters = {}
+    filters = {'assignee': 'none'}
 
-    if user and user.get_languages():
-        filters['language'] = 'mine,none'
-
-    filters['assignee'] = 'none'
+    widget_settings = {}
+    from apps.widget.rpc import add_general_settings
+    add_general_settings(request, widget_settings)
 
     # TODO: Filter by permissions
     #
@@ -1160,8 +1169,10 @@ def dashboard(request, slug):
 
     videos = {}
     video_pks = set()
-    tasks = _tasks_list(request, team, None, filters, user)
-    
+
+    tasks = _tasks_list(request, team, None, filters, user)[0:TASKS_ON_PAGE]
+    _cache_video_url(tasks)
+
     for task in tasks:
         pk = str(task.team_video.id)
         
@@ -1176,13 +1187,14 @@ def dashboard(request, slug):
     context = {
         'team': team,
         'member': member,
-        'videos': videos
+        'videos': videos,
+        'widget_settings': widget_settings
     }
 
     if user:
         user_filter = {'assignee':str(user.id)}
-        user_tasks = _tasks_list(request, team, None, user_filter, user)
-        user_tasks.order_by('expiration_date')
+        user_tasks = _tasks_list(request, team, None, user_filter, user).order_by('expiration_date')[0:14]
+        _cache_video_url(user_tasks)
         context['user_tasks'] = user_tasks
 
     return context
