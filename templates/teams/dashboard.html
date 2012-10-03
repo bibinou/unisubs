@@ -63,7 +63,7 @@
                                     <span class="due overdue">Overdue by {{ task.expiration_date|timesince }}</span>
                                 {% endif %}
                             {% endif %}
-                            <a class="perform-task perform-task-{{ task.pk }} button reduced" id="task-{{ task.id }}">
+                            <a href="{{ task.get_widget_url }}" class="perform-task perform-task-{{ task.pk }} button reduced" id="task-{{ task.id }}">
                                 {{ task.get_type_display }}
                                 {% if task.get_language_display %}
                                     {{ task.get_language_display }}
@@ -110,7 +110,7 @@
                                             <ul>
                                                 {% for task in team_video.tasks %}
                                                     <li>
-                                                        <a class="perform-task-{{ task.pk }}" href="" title="Get started now">
+                                                        <a class="perform-task-{{ task.pk }}" href="{{ task.get_widget_url }}" title="Get started now">
                                                             {% if task.get_type_display == 'Subtitle' %}
                                                                 {% trans "Create Subtitles" %}
                                                             {% else %}
@@ -127,7 +127,7 @@
                                         </div>
                                     {% else %}
                                         {% with task=team_video.tasks|first %}
-                                            <a href="#" class="perform-task-{{ task.pk }}" title="Get started now">
+                                        <a href="{{ task.get_widget_url }}" class="perform-task-{{ task.pk }}" title="Get started now">
                                                 {% if task.get_type_display == 'Subtitle' or task.get_type_display == 'Translate' %}
                                                     Needs {{ task.get_language_display }} subtitles
                                                 {% else %}
