@@ -1154,6 +1154,11 @@ def dashboard(request, slug):
     user = request.user if request.user.is_authenticated() else None
     member = team.members.get(user=user) if user else None
 
+    if user:
+        user_filter = {'assignee':str(user.id)}
+        user_tasks = _tasks_list(request, team, None, user_filter, user).order_by('expiration_date')[0:14]
+        _cache_video_url(user_tasks)
+
     filters = {'assignee': 'none'}
 
     widget_settings = {}
@@ -1174,6 +1179,9 @@ def dashboard(request, slug):
     _cache_video_url(tasks)
 
     for task in tasks:
+        if not can_perform_task(user, task):
+            continue
+
         pk = str(task.team_video.id)
         
         if not pk in video_pks:
@@ -1187,15 +1195,10 @@ def dashboard(request, slug):
     context = {
         'team': team,
         'member': member,
+        'user_tasks': user_tasks,
         'videos': videos,
         'widget_settings': widget_settings
     }
-
-    if user:
-        user_filter = {'assignee':str(user.id)}
-        user_tasks = _tasks_list(request, team, None, user_filter, user).order_by('expiration_date')[0:14]
-        _cache_video_url(user_tasks)
-        context['user_tasks'] = user_tasks
 
     return context
 
