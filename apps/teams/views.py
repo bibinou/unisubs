@@ -52,7 +52,8 @@ from teams.forms import (
 )
 from teams.models import (
     Team, TeamMember, Invite, Application, TeamVideo, Task, Project, Workflow,
-    Setting, TeamLanguagePreference, SubtitleVersion
+    Setting, TeamLanguagePreference, SubtitleVersion, InviteExpiredException,
+    BillingReport, ApplicationInvalidException
 )
 from teams.permissions import (
     can_add_video, can_assign_role, can_assign_tasks, can_create_task_subtitle,
@@ -68,8 +69,9 @@ from teams.signals import api_teamvideo_new, api_subtitles_rejected
 from teams.tasks import (
     invalidate_video_caches, invalidate_video_moderation_caches,
     update_video_moderation, update_one_team_video, update_video_public_field,
-    invalidate_video_visibility_caches
+    invalidate_video_visibility_caches, process_billing_report
 )
+from apps.videos.tasks import video_changed_tasks
 from utils import render_to, render_to_json, DEFAULT_PROTOCOL
 from utils.forms import flatten_errorlists
 from utils.metrics import time as timefn, Timer
@@ -85,6 +87,7 @@ from videos.models import Action, VideoUrl, SubtitleLanguage, Video
 from widget.rpc import add_general_settings
 from widget.views import base_widget_params
 from widget.srt_subs import GenerateSubtitlesHandler
+from raven.contrib.django.models import client
 
 
 logger = logging.getLogger("teams.views")
@@ -264,8 +267,8 @@ def settings_guidelines(request, slug):
                 setting.data = val
                 setting.save()
 
-        messages.success(request, _(u'Guidelines and messages updated.'))
-        return HttpResponseRedirect(request.path)
+            messages.success(request, _(u'Guidelines and messages updated.'))
+            return HttpResponseRedirect(request.path)
     else:
         form = GuidelinesMessagesForm(initial=initial)
 
@@ -392,6 +395,19 @@ def settings_languages(request, slug):
     return { 'team': team, 'form': form }
 
 
+def _default_project_for_team(team):
+    """Get the default project to filter by for the videos/tasks lists
+    """
+    if team.slug == 'ted':
+        # :( Logic for the TED team is hardcoded here
+        try:
+            return Project.objects.get(team=team, slug='tedtalks')
+        except Project.DoesNotExist:
+            logging.warning("_default_project_for_team: "
+                    "tedtalks project does not exist")
+            return None
+    else:
+        return None
 # Videos
 @timefn
 @render_to('teams/videos-list.html')
@@ -399,16 +415,22 @@ def detail(request, slug, project_slug=None, languages=None):
     team = Team.get(slug, request.user)
     filtered = 0
 
+    if project_slug is None:
+        project_slug = request.GET.get('project')
+
     if project_slug is not None:
-        project = get_object_or_404(Project, team=team, slug=project_slug)
+        if project_slug == 'any':
+            project = None
+        else:
+            project = get_object_or_404(Project, team=team, slug=project_slug)
     else:
-        project = None
+        project = _default_project_for_team(team)
 
     query = request.GET.get('q')
     sort = request.GET.get('sort')
-    language = request.GET.get('lang')
-
-    if language:
+    language = request.GET.get('lang'
+)
+    if language or project_slug:
         filtered = filtered + 1
 
     if language != 'none':
@@ -454,6 +476,8 @@ def detail(request, slug, project_slug=None, languages=None):
     language_choices = [(code, name) for code, name in get_language_choices()
                         if code in readable_langs]
 
+    extra_context['project_choices'] = team.project_set.exclude(name='_root')
+
     extra_context['language_choices'] = language_choices
     extra_context['query'] = query
 
@@ -497,7 +521,6 @@ def detail(request, slug, project_slug=None, languages=None):
                 if record._team_video:
                     record._team_video.original_language_code = record.original_language
                     record._team_video.completed_langs = record.video_completed_langs
-
     return extra_context
 
 @render_to('teams/add_video.html')
@@ -526,7 +549,9 @@ def add_video(request, slug):
         obj = form.save(False)
         obj.added_by = request.user
         obj.save()
+
         api_teamvideo_new.send(obj)
+        video_changed_tasks.delay(obj.video.pk)
         messages.success(request, form.success_message())
         return redirect(team.get_absolute_url())
 
@@ -563,10 +588,9 @@ def add_videos(request, slug):
     form = AddTeamVideosFromFeedForm(team, request.user, request.POST or None)
 
     if form.is_valid():
-        team_videos = form.save()
-        [api_teamvideo_new.send(tv) for tv in team_videos]
-        messages.success(request, form.success_message() % {'count': len(team_videos)})
-        return redirect(team)
+        form.save()
+        messages.success(request, form.success_message())
+        return redirect(team.get_absolute_url())
 
     return { 'form': form, 'team': team, }
 
@@ -680,6 +704,7 @@ def activity(request, slug):
 
     return context
 
+
 # Members
 @timefn
 @render_to('teams/members-list.html')
@@ -758,6 +783,8 @@ def remove_member(request, slug, user_pk):
     if can_assign_role(team, request.user, member.role, member.user):
         user = member.user
         if not user == request.user:
+            [application.on_member_removed(author=request.user, interface='web UI') for application in \
+             team.applications.filter(user=user, status=Application.STATUS_APPROVED)]
             TeamMember.objects.filter(team=team, user=user).delete()
             messages.success(request, _(u'Member has been removed from the team.'))
             return HttpResponseRedirect(return_path)
@@ -775,7 +802,9 @@ def applications(request, slug):
     if not team.is_member(request.user):
         return  HttpResponseForbidden("Not allowed")
 
-    qs = team.applications.all()
+    # default to showing only applications that need to be acted upon
+    status = int(request.GET.get('status', Application.STATUS_PENDING))
+    qs = team.applications.filter(status=status)
 
     extra_context = {
         'team': team
@@ -787,36 +816,42 @@ def applications(request, slug):
                        extra_context=extra_context)
 
 @login_required
-def approve_application(request, slug, user_pk):
+def approve_application(request, slug, application_pk):
     team = Team.get(slug, request.user)
 
     if not team.is_member(request.user):
         raise Http404
 
     if can_invite(team, request.user):
+        application = team.applications.get(pk=application_pk)
         try:
-            Application.objects.get(team=team, user=user_pk).approve()
+            application.approve(request.user, "web UI")
             messages.success(request, _(u'Application approved.'))
         except Application.DoesNotExist:
             messages.error(request, _(u'Application does not exist.'))
+        except ApplicationInvalidException:
+            messages.error(request, _(u'Application already processed.'))
     else:
         messages.error(request, _(u'You can\'t approve applications.'))
 
     return redirect('teams:applications', team.pk)
 
 @login_required
-def deny_application(request, slug, user_pk):
+def deny_application(request, slug, application_pk):
     team = Team.get(slug, request.user)
 
     if not team.is_member(request.user):
         raise Http404
 
     if can_invite(team, request.user):
+        application = team.applications.get(pk=application_pk)
         try:
-            Application.objects.get(team=team, user=user_pk).deny()
+            application.deny(request.user, "web UI")
             messages.success(request, _(u'Application denied.'))
         except Application.DoesNotExist:
             messages.error(request, _(u'Application does not exist.'))
+        except ApplicationInvalidException:
+            messages.error(request, _(u'Application already processed.'))
     else:
         messages.error(request, _(u'You can\'t deny applications.'))
 
@@ -850,13 +885,14 @@ def invite_members(request, slug):
 @login_required
 def accept_invite(request, invite_pk, accept=True):
     invite = get_object_or_404(Invite, pk=invite_pk, user=request.user)
-    if accept:
-        ok = invite.accept()
-    else:
-        ok = invite.deny()
-    if ok:
-        return redirect(request.META.get('HTTP_REFERER', '/'))
-    else:
+    try:
+        if accept:
+            invite.accept()
+            return redirect(reverse("teams:detail", kwargs={"slug": invite.team.slug}))
+        else:
+            invite.deny()
+            return redirect(request.META.get('HTTP_REFERER', '/'))
+    except InviteExpiredException:
         return HttpResponseServerError(render_to_response("generic-error.html", {
             "error_msg": _("This invite is no longer valid"),
         }, RequestContext(request)))
@@ -916,10 +952,12 @@ def leave_team(request, slug):
         tm_user_pk = member.user.pk
         team_pk = member.team.pk
         member.delete()
+        [application.on_member_leave(request.user, "web UI") for application in \
+         member.team.applications.filter(status=Application.STATUS_APPROVED)]
+            
         notifier.team_member_leave(team_pk, tm_user_pk)
 
         messages.success(request, _(u'You have left this team.'))
-
     return redirect(request.META.get('HTTP_REFERER') or team)
 
 @permission_required('teams.change_team')
@@ -1023,28 +1061,6 @@ def _task_languages(team, user):
             })
     return lang_data
 
-def _task_category_counts(team, filters, user):
-    tasks = team.task_set.incomplete()
-
-    if filters['language']:
-        tasks = tasks.filter(language=filters['language'])
-
-    if filters['team_video']:
-        tasks = tasks.filter(team_video=int(filters['team_video']))
-
-    if filters['assignee']:
-        if filters['assignee'] == 'none':
-            tasks = tasks.filter(assignee=None)
-        else:
-            tasks = tasks.filter(assignee=user)
-
-    counts = { 'all': tasks.count() }
-
-    for type in ['Subtitle', 'Translate', 'Review', 'Approve']:
-        counts[type.lower()] = tasks.filter(type=Task.TYPE_IDS[type]).count()
-
-    return counts
-
 def _tasks_list(request, team, project, filters, user):
     '''List tasks for the given team, optionally filtered.
 
@@ -1070,10 +1086,11 @@ def _tasks_list(request, team, project, filters, user):
         tasks = tasks.filter(completed=None)
 
     if filters.get('language'):
-        if filters.get('language') != 'all':
+        if filters['language'] != 'all':
             tasks = tasks.filter(language=filters['language'])
     elif request.user.is_authenticated() and request.user.get_languages():
-        tasks = tasks.filter(language__in=[ul.language for ul in request.user.get_languages()])
+        languages = [ul.language for ul in request.user.get_languages()] + ['']
+        tasks = tasks.filter(language__in=languages)
 
     if filters.get('q'):
         terms = get_terms(filters['q'])
@@ -1095,7 +1112,7 @@ def _tasks_list(request, team, project, filters, user):
             tasks = tasks.filter(assignee=None)
         elif assignee and assignee.isdigit():
             tasks = tasks.filter(assignee=int(assignee))
-        elif assignee:
+        elif assignee and assignee != 'anyone':
             tasks = tasks.filter(assignee=User.objects.get(username=assignee))
     else:
         tasks = tasks.filter(assignee=None)
@@ -1129,18 +1146,14 @@ def _get_task_filters(request):
 
 @timefn
 @render_to('teams/tasks.html')
-def team_tasks(request, slug, project_slug=None):
+def team_tasks(request, slug):
     team = Team.get(slug, request.user)
 
     if not can_view_tasks_tab(team, request.user):
         messages.error(request, _("You cannot view this team's tasks."))
         return HttpResponseRedirect(team.get_absolute_url())
 
-    # TODO: Review this
-    if project_slug is not None:
-        project = get_object_or_404(Project, team=team, slug=project_slug)
-    else:
-        project = None
+    project_slug = request.GET.get('project')
 
     user = request.user if request.user.is_authenticated() else None
     member = team.members.get(user=user) if user else None
@@ -1149,9 +1162,24 @@ def team_tasks(request, slug, project_slug=None):
     filters = _get_task_filters(request)
     filtered = 0
 
+    if project_slug is not None:
+        if project_slug == 'any':
+            project = None
+        else:
+            project = get_object_or_404(Project, team=team, slug=project_slug)
+    else:
+        # User didn't specify a project to filter on.  We use the default
+        # project only if:
+        #   - There was no team_video specified
+        #   - The user isn't looking at their own tasks
+        if (filters.get('team_video') is None and
+                filters.get('assignee') != 'me'):
+            project = _default_project_for_team(team)
+        else:
+            project = None
+
     tasks = _order_tasks(request,
                          _tasks_list(request, team, project, filters, user))
-    category_counts = _task_category_counts(team, filters, request.user)
     tasks, pagination_info = paginate(tasks, TASKS_ON_PAGE, request.GET.get('page'))
 
     # We pull out the task IDs here for performance.  It's ugly, I know.
@@ -1182,7 +1210,7 @@ def team_tasks(request, slug, project_slug=None):
             filters['assignee'] == None
         elif filters['assignee'].isdigit():
             filters['assignee'] = team.members.get(user=filters['assignee'])
-        else:
+        elif filters['assignee'] != 'anyone':
             filters['assignee'] = team.members.get(user=User.objects.get(username=filters['assignee']))
 
         filtered = filtered + 1
@@ -1191,6 +1219,9 @@ def team_tasks(request, slug, project_slug=None):
         filtered = filtered + 1
 
     if filters.get('type'):
+        filtered = filtered + 1
+
+    if project_slug is not None:
         filtered = filtered + 1
 
     widget_settings = {}
@@ -1213,13 +1244,13 @@ def team_tasks(request, slug, project_slug=None):
         'user_can_assign_tasks': can_assign_tasks(team, request.user),
         'assign_form': TaskAssignForm(team, member),
         'languages': languages,
-        'category_counts': category_counts,
         'tasks': tasks,
         'filters': filters,
         'widget_settings': widget_settings,
         'filtered': filtered,
         'member': member,
-        'upload_draft_form': UploadDraftForm(user=request.user)
+        'upload_draft_form': UploadDraftForm(user=request.user),
+        'project_choices': team.project_set.exclude(name='_root'),
     }
 
     context.update(pagination_info)
@@ -1272,7 +1303,9 @@ def create_task(request, slug, team_video_pk):
 @login_required
 def perform_task(request, slug=None, task_pk=None):
     task_pk = task_pk or request.POST.get('task_id')
-    task = Task.objects.get(pk=task_pk)
+
+    task = get_object_or_404(Task, pk=task_pk)
+
     if slug:
         team = get_object_or_404(Team,slug=slug)
         if task.team != team:
@@ -1396,12 +1429,21 @@ def upload_draft(request, slug):
     if request.POST:
         form = UploadDraftForm(request.user, request.POST, request.FILES)
 
-        if form.is_valid():
+        try:
+            is_valid = form.is_valid()
+        except Exception, e:
+            client.create_from_exception()
+            messages.error(u"Sorry, there was a problem while uploading your draft. Care to try again?")
+            transaction.rollback()
+            is_valid = False
+
+        if is_valid:
             try:
                 form.save()
             except Exception, e:
                 messages.error(request, unicode(e))
                 transaction.rollback()
+                client.create_from_exception()
             else:
                 messages.success(request, _(u"Draft uploaded successfully."))
                 transaction.commit()
@@ -1453,6 +1495,7 @@ def download_draft(request, slug, task_pk, type="srt"):
     response['Content-Disposition'] = 'attachment; ' + filename_header
 
     return response
+
 
 # Projects
 def project_list(request, slug):
@@ -1722,71 +1765,6 @@ def auto_captions_status(request, slug):
 
 
 # Billing
-
-def get_billing_data_for_team(team, start_date, end_date, header=True):
-    """
-    Return a list of lists of data suitable for the csv writer or similar.
-
-    ``start_date`` and ``end_date`` should be ``datetime.date`` instances
-
-    * Get all videos for team
-    * For each video, get all languages
-    * For each language, get the latest version
-    * If the version is approved and within the time constraints, add it.
-
-    Minutes are counted by
-        [last subtitle synced timing] - [first subtitle synced timing]
-    """
-    from datetime import datetime, time
-    rows = []
-
-    # Oh, Python...
-    midnight = time(0, 0, 0)
-    start_date = datetime.combine(start_date, midnight)
-    end_date = datetime.combine(end_date, midnight)
-
-    if header:
-        rows.append(['Video title', 'Video URL', 'Video language',
-                'Billable minutes'])
-
-    tvs = TeamVideo.objects.filter(team=team).order_by('video__title')
-
-    domain = Site.objects.get_current().domain
-    protocol = getattr(settings, 'DEFAULT_PROTOCOL')
-    host = '%s://%s' % (protocol, domain)
-
-    for tv in tvs:
-        languages = tv.video.subtitlelanguage_set.all()
-
-        for language in languages:
-            v = language.latest_version()
-
-            if not v or v.moderation_status != APPROVED:
-                continue
-
-            if (v.datetime_started < start_date) or (v.datetime_started >
-                    end_date):
-                continue
-
-            subs = list(v.subtitle_set.filter(start_time__isnull=False,
-                end_time__isnull=False))
-
-            if len(subs) == 0:
-                continue
-
-            start = subs[0].start_time
-            end = subs[-1].end_time
-
-            rows.append([
-                tv.video.title.encode('utf-8'),
-                host + tv.video.get_absolute_url(),
-                language.language,
-                int(round((end - start) / 60))
-            ])
-
-    return rows
-
-
 @staff_member_required
 def billing(request):
     user = request.user
@@ -1801,23 +1779,17 @@ def billing(request):
             start_date = form.cleaned_data.get('start_date')
             end_date = form.cleaned_data.get('end_date')
 
-            f = 'billing-%s' % team.slug
+            report = BillingReport.objects.create(team=team,
+                    start_date=start_date, end_date=end_date)
 
-            response = HttpResponse(mimetype='text/csv')
-            response['Content-Disposition'] = 'attachment;filename=%s.csv' % f
+            process_billing_report.delay(report.pk)
 
-            writer = csv.writer(response)
-
-            with Timer('billing-csv-time'):
-                data = get_billing_data_for_team(team, start_date, end_date)
-
-            for row in data:
-                writer.writerow(row)
-
-            return response
     else:
         form = ChooseTeamForm()
 
+    reports = BillingReport.objects.all().order_by('-pk')
+
     return render_to_response('teams/billing/choose.html', {
-        'form': form
+        'form': form,
+        'reports': reports
     }, RequestContext(request))

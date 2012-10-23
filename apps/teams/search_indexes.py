@@ -103,7 +103,7 @@ class TeamVideoLanguagesIndex(SearchIndex):
             self.prepared_data['original_language'] = ''
         self.prepared_data['absolute_url'] = obj.get_absolute_url()
         self.prepared_data['thumbnail'] = obj.get_thumbnail()
-        self.prepared_data['title'] = unicode(obj).strip()
+        self.prepared_data['title'] = obj.video.title_display_unabridged()
         self.prepared_data['description'] = obj.description
         self.prepared_data['is_complete'] = obj.video.complete_date is not None
         self.prepared_data['video_complete_date'] = obj.video.complete_date
@@ -131,7 +131,7 @@ class TeamVideoLanguagesIndex(SearchIndex):
 
         team_video = obj.video.get_team_video()
 
-        self.prepared_data['is_public'] =  obj.video.is_public
+        self.prepared_data['is_public'] =  team_video.team.is_visible 
         self.prepared_data["owned_by_team_id"] = team_video.team.id if team_video else None
 
         return self.prepared_data

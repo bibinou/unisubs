@@ -28,7 +28,8 @@ from teams.models import Task, Workflow, Team
 from teams.moderation_const import APPROVED, UNMODERATED, WAITING_MODERATION
 from teams.permissions import (
     can_create_and_edit_subtitles, can_create_and_edit_translations,
-    can_publish_edits_immediately, can_review, can_approve, can_assign_task
+    can_publish_edits_immediately, can_review, can_approve, can_assign_task,
+    can_post_edit_subtitles
 )
 from teams.signals import (
     api_subtitles_edited, api_subtitles_approved, api_subtitles_rejected,
@@ -39,13 +40,14 @@ from utils import send_templated_email
 from utils.forms import flatten_errorlists
 from utils.metrics import Meter
 from utils.translation import get_user_languages_from_request
-from videos import models
-from videos.models import record_workflow_origin
+from videos import models, is_synced_value
+from videos.models import record_workflow_origin, Subtitle
 from videos.tasks import video_changed_tasks
 from widget import video_cache
 from widget.base_rpc import BaseRpc
 from widget.forms import  FinishReviewForm, FinishApproveForm
 from widget.models import SubtitlingSession
+from libs.bulkops import insert_many
 
 from functools import partial
 
@@ -163,10 +165,12 @@ class Rpc(BaseRpc):
             return None
 
         error = self._check_visibility_policy_for_widget(request, video_id)
+
         if error:
             return error
 
         video_urls, video_id, error = self._get_video_urls_for_widget(video_url, video_id)
+
         if error:
             return error
 
@@ -176,6 +180,7 @@ class Rpc(BaseRpc):
             'video_urls': video_urls,
             'is_moderated': video_cache.get_is_moderated(video_id),
         }
+
         if additional_video_urls is not None:
             for url in additional_video_urls:
                 video_cache.associate_extra_url(url, video_id)
@@ -199,6 +204,37 @@ class Rpc(BaseRpc):
 
 
     # Start Dialog (aka "Subtitle Into" Dialog)
+    def _get_blocked_languages(self, team_video, user):
+        # This is yet another terrible hack for the tasks system.  I'm sorry.
+        #
+        # Normally the in-progress languages will be marked as disabled in the
+        # language_summary call, but that doesn't happen for languages that
+        # don't have SubtitleLanguage objects yet, i.e. ones that have a task
+        # but haven't been started yet.
+        #
+        # This function returns a list of languages that should be disabled ON
+        # TOP OF the already-disabled ones.
+        #
+        # Here's a kitten to cheer you up:
+        #
+        #                     ,_
+        #            (\(\      \\
+        #            /.. \      ||
+        #            \Y_, '----.//
+        #              )        /
+        #              |   \_/  ;
+        #               \\ |\`\ |
+        #          jgs  ((_/(_(_/
+        if team_video:
+            tasks = team_video.task_set.incomplete()
+
+            if user.is_authenticated():
+                tasks = tasks.exclude(assignee=user)
+
+            return list(tasks.values_list('language', flat=True))
+        else:
+            return []
+
     def fetch_start_dialog_contents(self, request, video_id):
         my_languages = get_user_languages_from_request(request)
         my_languages.extend([l[:l.find('-')] for l in my_languages if l.find('-') > -1])
@@ -214,12 +250,16 @@ class Rpc(BaseRpc):
         tv = video.get_team_video()
         writable_langs = list(tv.team.get_writable_langs()) if tv else []
 
+        blocked_langs = self._get_blocked_languages(team_video, request.user)
+
         return {
             'my_languages': my_languages,
             'video_languages': video_languages,
             'original_language': original_language,
             'limit_languages': writable_langs,
-            'is_moderated': video.is_moderated, }
+            'is_moderated': video.is_moderated,
+            'blocked_languages': blocked_langs
+        }
 
 
     # Fetch Video ID and Settings
@@ -227,24 +267,35 @@ class Rpc(BaseRpc):
         is_original_language_subtitled = self._subtitle_count(video_id) > 0
         general_settings = {}
         add_general_settings(request, general_settings)
+
         return {
             'video_id': video_id,
             'is_original_language_subtitled': is_original_language_subtitled,
-            'general_settings': general_settings }
+            'general_settings': general_settings 
+        }
 
 
     # Ugly hack for N caption display.
     def get_caption_display_mode(self, language):
         team_video = language.video.get_team_video()
-        _NETFLIX_TEAMS = ['netflix', 'netflix-private', 'netflix-applicant']
-        if team_video and team_video.team.slug in _NETFLIX_TEAMS:
+        _NETFLIX_TEAMS = ['netflix', 'netflix-private', 'netflix-applicant', 'netflix-n']
+        if team_video and team_video.team.slug.lower() in _NETFLIX_TEAMS:
             return 'n'
         else:
             return 'normal'
 
+    # Ugly hack to disable timing changes for T translations :(
+    def get_timing_mode(self, language):
+        team_video = language.video.get_team_video()
+        _TED_TEAMS = ['ted', 'ted-transcribe']
+        if team_video and team_video.team.slug.lower() in _TED_TEAMS:
+            return 'off'
+        else:
+            return 'on'
+
 
     # Start Editing
-    def _check_team_video_locking(self, user, video_id, language_code, is_translation, mode, is_edit):
+    def _check_team_video_locking(self, user, video_id, language_code, is_translation=None, mode=None, is_edit=None):
         """Check whether the a team prevents the user from editing the subs.
 
         Returns a dict appropriate for sending back if the user should be
@@ -257,12 +308,25 @@ class Rpc(BaseRpc):
         if not team_video:
             # If there's no team video to worry about, just bail early.
             return None
+        
+        team = team_video.team
 
-        if team_video.team.is_visible:
+        if team.is_visible:
             message = _(u"These subtitles are moderated. See the %s team page for information on how to contribute." % str(team_video.team))
         else:
             message = _(u"Sorry, these subtitles are privately moderated.")
 
+        if not team_video.video.can_user_see(user):
+             return { "can_edit": False, "locked_by": str(team_video.team), "message": message }
+
+        language = video.subtitle_language(language_code)
+
+        if (language and language.is_complete_and_synced()
+                     and team.moderates_videos()
+                     and not can_post_edit_subtitles(team, user)):
+            message = _("Sorry, you can't post-edit these subtitles.")
+            return { "can_edit": False, "locked_by": str(team_video.team), "message": message }
+            
         # Check that there are no open tasks for this action.
         tasks = team_video.task_set.incomplete().filter(language__in=[language_code, ''])
 
@@ -324,6 +388,7 @@ class Rpc(BaseRpc):
         other functions.
 
         """
+
         # TODO: remove whenever blank SubtitleLanguages become illegal.
         self._fix_blank_original(video_id)
 
@@ -360,6 +425,7 @@ class Rpc(BaseRpc):
         return_dict = { "can_edit": True,
                         "session_pk": session.pk,
                         "caption_display_mode": self.get_caption_display_mode(language),
+                        "timing_mode": self.get_timing_mode(language),
                         "subtitles": subtitles }
 
         # If this is a translation, include the subtitles it's based on in the response.
@@ -383,7 +449,16 @@ class Rpc(BaseRpc):
 
     # Resume Editing
     def resume_editing(self, request, session_pk):
-        session = SubtitlingSession.objects.get(pk=session_pk)
+        try:
+            session = SubtitlingSession.objects.get(pk=session_pk)
+        except SubtitlingSession.DoesNotExist:
+            return {'response': 'cannot_resume'}
+
+        error = self._check_team_video_locking(request.user, session.video.video_id, session.language.language)
+
+        if error:
+            return {'response': 'cannot_resume'}
+
         if session.language.can_writelock(request) and \
                 session.parent_version == session.language.version():
             session.language.writelock(request)
@@ -399,6 +474,7 @@ class Rpc(BaseRpc):
                             "can_edit" : True,
                             "session_pk" : session.pk,
                             "caption_display_mode": self.get_caption_display_mode(session.language),
+                            "timing_mode": self.get_timing_mode(session.language),
                             "subtitles" : subtitles }
             if session.base_language:
                 return_dict['original_subtitles'] = \
@@ -538,22 +614,38 @@ class Rpc(BaseRpc):
             if error:
                 return error
 
-    def _save_subtitles(self, subtitle_set, json_subs, forked):
-        """Create Subtitle objects into the given queryset from the JSON subtitles."""
-
+    def _save_subtitles(self, version, json_subs, forked):
+        """Create Subtitle objects into the version from the JSON subtitles."""
+        subtitles = []
         for s in json_subs:
             if not forked:
-                subtitle_set.create(
-                    subtitle_id=s['subtitle_id'],
-                    subtitle_text=s['text'])
+                s = Subtitle(subtitle_id=s['subtitle_id'],
+                             subtitle_text=s['text'])
             else:
-                subtitle_set.create(
-                    subtitle_id=s['subtitle_id'],
-                    subtitle_text=s['text'],
-                    start_time=s['start_time'],
-                    end_time=s['end_time'],
-                    subtitle_order=s['sub_order'],
-                    start_of_paragraph=s.get('start_of_paragraph', False))
+                # Normally this is done in Subtitle.save(), but bulk inserting
+                # doesn't call that.
+                start_time = s['start_time']
+                end_time = s['end_time']
+                if not is_synced_value(start_time):
+                    start_time = None
+                if not is_synced_value(end_time):
+                    end_time = None
+
+                s = Subtitle(subtitle_id=s['subtitle_id'],
+                             subtitle_text=s['text'],
+                             start_time=start_time,
+                             end_time=end_time,
+                             subtitle_order=s['sub_order'],
+                             start_of_paragraph=s.get('start_of_paragraph',
+                                                      False))
+            s.version_id = version.pk
+            subtitles.append(s)
+
+        # For huge sets of subtitles, adding each one to the DB one at a time
+        # can take longer than the browser timeout.  We need to do this in the
+        # background instead.  For now.  This is all going away once the new
+        # data model refactor lands.  I love hacking stuff in on the fly.
+        insert_many(subtitles)
 
     def _copy_subtitles(self, source_version, dest_version):
         """Copy the Subtitle objects from one version to another, unchanged.
@@ -597,7 +689,7 @@ class Rpc(BaseRpc):
 
             if subtitles_changed:
                 self._save_subtitles(
-                    new_version.subtitle_set, subtitles, new_version.is_forked)
+                    new_version, subtitles, new_version.is_forked)
             else:
                 self._copy_subtitles(previous_version, new_version)
 
@@ -1152,8 +1244,17 @@ def language_summary(language, team_video=-1, user=None):
             if user and user != task.assignee:
                 summary['disabled_to'] = True
 
-    if not language.latest_version():
+    if language.latest_version():
+        # Languages with existing subtitles cannot be selected as a "to"
+        # language in the "add new translation" dialog.  If you want to work on
+        # that language, select it and hit "Improve these Subtitles" instead.
+        summary['disabled_to'] = True
+    else:
+        # Languages with *no* existing subtitles cannot be selected as a "from"
+        # language in the "add new translation" dialog.  There's nothing to work
+        # from!
         summary['disabled_from'] = True
+
 
     if language.is_dependent():
         summary['percent_done'] = language.percent_done

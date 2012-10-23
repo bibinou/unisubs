@@ -17,12 +17,14 @@
 # http://www.gnu.org/licenses/agpl-3.0.html.
 import datetime
 import logging
+import csv
 
 from django.conf import settings
 from django.contrib.contenttypes.models import ContentType
 from django.contrib.sites.models import Site
 from django.core.exceptions import ValidationError
 from django.core.urlresolvers import reverse
+from django.core.files import File
 from django.db import models
 from django.db.models.signals import post_save, post_delete, pre_delete
 from django.http import Http404
@@ -36,8 +38,7 @@ from apps.comments.models import Comment
 from auth.models import CustomUser as User
 from auth.providers import get_authentication_provider
 from messages import tasks as notifier
-from messages.models import Message
-from teams.moderation_const import WAITING_MODERATION, UNMODERATED
+from teams.moderation_const import WAITING_MODERATION, UNMODERATED, APPROVED
 from teams.permissions_const import (
     TEAM_PERMISSIONS, PROJECT_PERMISSIONS, ROLE_OWNER, ROLE_ADMIN, ROLE_MANAGER,
     ROLE_CONTRIBUTOR
@@ -45,7 +46,7 @@ from teams.permissions_const import (
 from videos.tasks import upload_subtitles_to_original_service
 from teams.tasks import update_one_team_video
 from utils import DEFAULT_PROTOCOL
-from utils.amazon import S3EnabledImageField
+from utils.amazon import S3EnabledImageField, S3EnabledFileField
 from utils.panslugify import pan_slugify
 from utils.searching import get_terms
 from videos.models import Video, SubtitleLanguage, SubtitleVersion
@@ -55,14 +56,6 @@ from functools import partial
 logger = logging.getLogger(__name__)
 
 ALL_LANGUAGES = [(val, _(name))for val, name in settings.ALL_LANGUAGES]
-
-
-def get_perm_names(model, perms):
-    return [("%s-%s-%s" % (model._meta.app_label,
-                           model._meta.object_name,
-                           p[0]),
-             p[1])
-            for p in perms]
 
 
 # Teams
@@ -173,6 +166,8 @@ class Team(models.Model):
             default=None, null=True, blank=True)
 
     deleted = models.BooleanField(default=False)
+    partner = models.ForeignKey('Partner', null=True, blank=True,
+            related_name='teams')
 
     objects = TeamManager()
     all_objects = models.Manager() # For accessing deleted teams, if necessary.
@@ -191,7 +186,7 @@ class Team(models.Model):
             self.default_project
 
     def __unicode__(self):
-        return self.name
+        return self.name or self.slug
 
     def render_message(self, msg):
         """Return a string of HTML represention a team header for a notification.
@@ -314,6 +309,12 @@ class Team(models.Model):
         if role:
             qs = qs.filter(role=role)
         return qs.exists()
+
+    def is_owner(self, user):
+        """
+        Return whether the given user is an owner of this team.
+        """
+        return self._is_role(user, TeamMember.ROLE_OWNER)
 
     def is_admin(self, user):
         """Return whether the given user is an admin of this team."""
@@ -441,7 +442,7 @@ class Team(models.Model):
 
         if query:
             for term in get_terms(query):
-                qs = qs.auto_query(qs.query.clean(term))
+                qs = qs.auto_query(qs.query.clean(term).decode('utf-8'))
 
         if language:
             qs = qs.filter(video_completed_langs=language)
@@ -632,7 +633,9 @@ class TeamVideo(models.Model):
     all_languages = models.BooleanField(_('Need help with all languages'), default=False,
         help_text=_(u'If you check this, other languages will not be displayed.'))
     added_by = models.ForeignKey(User)
-    created = models.DateTimeField(auto_now_add=True)
+    # this is an auto_add like field, but done on the model save so the
+    # admin doesn't throw a fit
+    created = models.DateTimeField(blank=True)
     completed_languages = models.ManyToManyField(SubtitleLanguage, blank=True)
     partner_id = models.CharField(max_length=100, blank=True, default="")
 
@@ -675,6 +678,13 @@ class TeamVideo(models.Model):
     def save(self, *args, **kwargs):
         if not hasattr(self, "project"):
             self.project = self.team.default_project
+
+        assert self.project.team == self.team, \
+                    "%s: Team (%s) is not equal to project's (%s) team (%s)"\
+                         % (self, self.team, self.project, self.project.team)
+
+        if not self.pk:
+            self.created = datetime.datetime.now()
         super(TeamVideo, self).save(*args, **kwargs)
 
 
@@ -1031,33 +1041,149 @@ class MembershipNarrowing(models.Model):
         return super(MembershipNarrowing, self).save(*args, **kwargs)
 
 
+class ApplicationInvalidException(Exception):
+    pass
+
+class ApplicationManager(models.Manager):
+
+    def can_apply(self, team, user):
+        """
+        A user can apply either if he is not a member of the team yet, the
+        team hasn't said no to the user (either application denied or removed the user'
+        and if no applications are pending.
+        """
+        sour_application_exists =  self.filter(team=team, user=user, status__in=[
+            Application.STATUS_MEMBER_REMOVED, Application.STATUS_DENIED,
+            Application.STATUS_PENDING]).exists()
+        if sour_application_exists:
+            return False
+        return  not team.is_member(user)
+
+    def open(self, team=None, user=None):
+        qs =  self.filter(status=Application.STATUS_PENDING)
+        if team:
+            qs = qs.filter(team=team)
+        if user:
+            qs = qs.filter(user=user)
+        return qs
+
 # Application
 class Application(models.Model):
     team = models.ForeignKey(Team, related_name='applications')
     user = models.ForeignKey(User, related_name='team_applications')
     note = models.TextField(blank=True)
+    # None -> not acted upon
+    # True -> Approved
+    # False -> Rejected
+    STATUS_PENDING,STATUS_APPROVED, STATUS_DENIED, STATUS_MEMBER_REMOVED,\
+        STATUS_MEMBER_LEFT = xrange(0, 5)
+    STATUSES = (
+        (STATUS_PENDING, u"Pending"),
+        (STATUS_APPROVED, u"Approved"),
+        (STATUS_DENIED, u"Denied"),
+        (STATUS_MEMBER_REMOVED, u"Member Removed"),
+        (STATUS_MEMBER_LEFT, u"Member Left"),
+    )
+    STATUSES_IDS = dict([choice[::-1] for choice in STATUSES])
 
+    status = models.PositiveIntegerField(default=STATUS_PENDING, choices=STATUSES)
+    created = models.DateTimeField(auto_now_add=True)
+    modified = models.DateTimeField(blank=True, null=True)
+
+    # free text keeping a log of changes to this application
+    history = models.TextField(blank=True, null=True)
+
+    objects = ApplicationManager()
     class Meta:
-        unique_together = (('team', 'user'),)
+        unique_together = (('team', 'user', 'status'),)
 
 
-    def approve(self):
+    def approve(self, author, interface):
         """Approve the application.
 
-        This will create an appropriate TeamMember record and then delete itself.
-
+        This will create an appropriate TeamMember if this application has
+        not been already acted upon
         """
-        TeamMember.objects.get_or_create(team=self.team, user=self.user)
-        self.delete()
+        if self.status not in (Application.STATUS_PENDING, Application.STATUS_MEMBER_LEFT):
+            raise ApplicationInvalidException("")
+        member, created = TeamMember.objects.get_or_create(team=self.team, user=self.user)
+        if created:
+            notifier.team_member_new.delay(member.pk)
+        self.modified = datetime.datetime.now()
+        self.status = Application.STATUS_APPROVED
+        self.save(author=author, interface=interface)
+        return self
 
-    def deny(self):
-        """Queue a Celery task that will handle properly denying this application."""
-
-        # We can't delete the row until the notification task has run.
+    def deny(self, author, interface):
+        """
+        Marks the application as not approved, then
+        Queue a Celery task that will handle properly denying this
+        application.
+        """
+        if self.status != Application.STATUS_PENDING:
+            raise ApplicationInvalidException("")
+        self.modified = datetime.datetime.now()
+        self.status = Application.STATUS_DENIED
+        self.save(author=author, interface=interface)
         notifier.team_application_denied.delay(self.pk)
+        return self
 
+    def on_member_leave(self, author, interface):
+        """
+        Marks the appropriate status, but users can still
+        reapply to a team if they so desire later.
+        """
+        self.status = Application.STATUS_MEMBER_LEFT
+        self.save(author=author, interface=interface)
+
+    def on_member_removed(self, author, interface):
+        """
+        Marks the appropriate status so that user's cannot reapply
+        to a team after being removed.
+        """
+        self.status = Application.STATUS_MEMBER_REMOVED
+        self.save(author=author, interface=interface)
+
+    def _generate_history_line(self, new_status, author=None, interface=None):
+        author = author or "?"
+        interface = interface or "web UI"
+        new_status = new_status if new_status != None else Application.STATUS_PENDING
+        for value,name in Application.STATUSES:
+            if value == new_status:
+                status = name
+        assert status
+        return u"%s by %s from %s (%s)\n" % (status, author, interface, datetime.datetime.now())
+
+    def save(self, dispatches_http_callback=True, author=None, interface=None, *args, **kwargs):
+        """
+        Saves the model, but also appends a line on the history for that
+        model, like these:
+           - CoolGuy Approved through the web UI.
+           - Arthur Left team through the web UI.
+        This way,we can keep one application per user per team, never
+        delete them (so the messages stay current) and we still can
+        track history
+        """
+        self.history = (self.history or "") + self._generate_history_line(self.status, author, interface)
+        super(Application, self).save(*args, **kwargs)
+        if dispatches_http_callback:
+            from teams.signals import api_application_new
+            api_application_new.send(self)
+
+    def __unicode__(self):
+        return "Application: %s - %s - %s" % (self.team.slug, self.user.username, self.get_status_display())
 
 # Invites
+class InviteExpiredException(Exception):
+    pass
+
+class InviteManager(models.Manager):
+    def pending_for(self, team, user):
+        return self.filter(team=team, user=user, approved=None)
+
+    def acted_on(self, team, user):
+        return self.filter(team=team, user=user, approved__notnull=True)
+
 class Invite(models.Model):
     team = models.ForeignKey(Team, related_name='invitations')
     user = models.ForeignKey(User, related_name='team_invitations')
@@ -1070,9 +1196,7 @@ class Invite(models.Model):
     # False -> Rejected
     approved = models.NullBooleanField(default=None)
 
-    class Meta:
-        unique_together = (('team', 'user'),)
-
+    objects = InviteManager()
 
     def accept(self):
         """Accept this invitation.
@@ -1081,15 +1205,15 @@ class Invite(models.Model):
         deletes itself.
 
         """
-        if self.approved == None:
-            self.approved = True
-            member, created = TeamMember.objects.get_or_create(team=self.team,
-                                                           user=self.user,
-                                                           role=self.role)
-            if created:
-                notifier.team_member_new.delay(member.pk)
-            self.save()
-            return True
+        if self.approved is not None:
+            raise InviteExpiredException("")
+        self.approved = True
+        member, created = TeamMember.objects.get_or_create(
+            team=self.team, user=self.user, role=self.role)
+        if created:
+            notifier.team_member_new.delay(member.pk)
+        self.save()
+        return True
 
     def deny(self):
         """Deny this invitation.
@@ -1097,10 +1221,10 @@ class Invite(models.Model):
         Could be useful to send a notification here in the future.
 
         """
-        if self.approved == None:
-            self.approved = False
-            self.save()
-            return True
+        if self.approved is not None:
+            raise InviteExpiredException("")
+        self.approved = False
+        self.save()
 
 
     def message_json_data(self, data, msg):
@@ -1859,8 +1983,8 @@ class Task(models.Model):
     def get_perform_url(self):
         '''Return the URL that will open whichever dialog is necessary to perform this task.'''
         mode = Task.TYPE_NAMES[self.type].lower()
-        if self.subtitle_version:
-            base_url = self.subtitle_version.language.get_widget_url(mode, self.pk)
+        if self.get_subtitle_version():
+            base_url = self.get_subtitle_version().language.get_widget_url(mode, self.pk)
         else:
             video = self.team_video.video
             if self.language and video.subtitle_language(self.language) :
@@ -2001,6 +2125,18 @@ class Setting(models.Model):
         (200, 'guidelines_subtitle'),
         (201, 'guidelines_translate'),
         (202, 'guidelines_review'),
+        # 300s means if this team will block those notifications
+        (300, 'block_invitation_sent_message'),
+        (301, 'block_application_sent_message'),
+        (302, 'block_application_denided_message'),
+        (303, 'block_team_member_new_message'),
+        (304, 'block_team_member_leave_message'),
+        (305, 'block_task_assigned_message'),
+        (306, 'block_reviewed_and_published_message'),
+        (307, 'block_reviewed_and_pending_approval_message'),
+        (308, 'block_reviewed_and_sent_back_message'),
+        (309, 'block_approved_message'),
+        (310, 'block_new_video_message'),
     )
     KEY_NAMES = dict(KEY_CHOICES)
     KEY_IDS = dict([choice[::-1] for choice in KEY_CHOICES])
@@ -2166,7 +2302,7 @@ post_save.connect(TeamLanguagePreference.objects.on_changed, TeamLanguagePrefere
 
 # TeamNotificationSettings
 class TeamNotificationSettingManager(models.Manager):
-    def notify_team(self, team_pk, video_id, event_name, language_pk=None, version_pk=None):
+    def notify_team(self, team_pk, event_name, **kwargs):
         """Notify the given team of a given event.
 
         Finds the matching notification settings for this team, instantiates
@@ -2180,11 +2316,21 @@ class TeamNotificationSettingManager(models.Manager):
 
         """
         try:
-            notification_settings = self.get(team__id=team_pk)
-        except TeamNotificationSetting.DoesNotExist:
+            team = Team.objects.get(pk=team_pk)
+        except Team.DoesNotExist:
+            logger.error("A pk for a non-existent team was passed in.",
+                    extra={"team_pk": team_pk, "event_name": event_name})
             return
-        notification_settings.notify(Video.objects.get(video_id=video_id), event_name,
-                                                 language_pk, version_pk)
+
+        if team.partner:
+            notification_settings = self.get(partner=team.partner)
+        else:
+            try:
+                notification_settings = self.get(team=team)
+            except TeamNotificationSetting.DoesNotExist:
+                return
+
+        notification_settings.notify(event_name, **kwargs)
 
 class TeamNotificationSetting(models.Model):
     """Info on how a team should be notified of changes to its videos.
@@ -2207,8 +2353,12 @@ class TeamNotificationSetting(models.Model):
     EVENT_SUBTITLE_NEW = "subs-new"
     EVENT_SUBTITLE_APPROVED = "subs-approved"
     EVENT_SUBTITLE_REJECTED = "subs-rejected"
+    EVENT_APPLICATION_NEW = 'application-new'
 
-    team = models.OneToOneField(Team, related_name="notification_settings")
+    team = models.OneToOneField(Team, related_name="notification_settings",
+            null=True, blank=True)
+    partner = models.OneToOneField('Partner',
+        related_name="notification_settings",  null=True, blank=True)
 
     # the url to post the callback notifing partners of new video activity
     request_url = models.URLField(blank=True, null=True)
@@ -2231,11 +2381,10 @@ class TeamNotificationSetting(models.Model):
         except ImportError:
             logger.exception("Apparently unisubs-integration is not installed")
 
-
-    def notify(self, video, event_name, language_pk=None, version_pk=None):
+    def notify(self, event_name,  **kwargs):
         """Resolve the notification class for this setting and fires notfications."""
-        notification = self.get_notification_class()(
-            self.team, video, event_name, language_pk, version_pk)
+        notification = self.get_notification_class()(self.team, self.partner,
+                event_name,  **kwargs)
         if self.request_url:
             success, content = notification.send_http_request(
                 self.request_url,
@@ -2245,9 +2394,167 @@ class TeamNotificationSetting(models.Model):
             return success, content
         # FIXME: spec and test this, for now just return
         return
-        if self.email:
-            notification.send_email(self.email, self.team, video, event_name, language_pk)
 
     def __unicode__(self):
-        return u'NotificationSettings for team %s' % (self.team)
+        if self.partner:
+            return u'NotificationSettings for partner %s' % self.partner
+        return u'NotificationSettings for team %s' % self.team
+
+
+class BillingReport(models.Model):
+    team = models.ForeignKey(Team)
+    start_date = models.DateField()
+    end_date = models.DateField()
+    csv_file = S3EnabledFileField(blank=True, null=True,
+            upload_to='teams/billing/')
+    processed = models.DateTimeField(blank=True, null=True)
+
+    def __unicode__(self):
+        return "%s (%s - %s)" % (self.team.slug,
+                self.start_date.strftime('%Y-%m-%d'),
+                self.end_date.strftime('%Y-%m-%d'))
+
+    def start_datetime(self):
+        midnight = datetime.time(0, 0, 0)
+        return datetime.datetime.combine(self.start_date, midnight)
+
+    def end_datetime(self):
+        almost_midnight = datetime.time(23, 59, 59)
+        return datetime.datetime.combine(self.end_date, almost_midnight)
+
+    def _should_bill(self, language, version, start, end):
+        if not version:
+            return False
+
+        if version.moderation_status not in [APPROVED, UNMODERATED]:
+            return False
+
+        # 97% is done according to our contracts
+        if version.moderation_status == UNMODERATED:
+            if not language.is_complete or language.percent_done < 97:
+                return False
+
+            if (version.datetime_started <= start or
+                    version.datetime_started >= end):
+                return False
+
+        return True
+
+    def _get_lang_data(self, languages, start_date):
+        workflow = self.team.get_workflow()
+
+        if workflow.approve_enabled:
+            lang_data = [(language, language.first_approved_version) for
+                                                language in languages]
+        else:
+            lang_data = [(language, language.latest_version()) for
+                                                language in languages]
+
+        old_version_counter = 1
+
+        for i, data in enumerate(lang_data):
+            lang, ver = data
+
+            if ver and ver.datetime_started < start_date:
+                lang_data.pop(i)
+                old_version_counter += 1
+
+        return lang_data, old_version_counter
+
+    def _get_row_data(self, host, header=None):
+        if not header:
+            header = []
+
+        rows = [header]
+
+        start_date = self.start_datetime()
+        end_date = self.end_datetime()
+
+        tvs = TeamVideo.objects.filter(team=self.team).order_by('video__title')
+
+        for tv in tvs:
+            languages = tv.video.subtitlelanguage_set.all()
+
+            lang_data, old_version_counter = self._get_lang_data(languages,
+                    start_date)
+
+            for language, v in lang_data:
+
+                if not self._should_bill(language, v, start_date, end_date):
+                    continue
+
+                subs = v.ordered_subtitles()
+
+                if len(subs) == 0:
+                    continue
+
+                start = subs[0].start_time
+                end = subs[-1].end_time
+
+                # The -1 value for the end_time isn't allowed anymore but some
+                # legacy data will still have it.
+                if end == -1:
+                    end = subs[-1].start_time
+
+                if not end:
+                    end = subs[-1].start_time
+
+                rows.append([
+                    tv.video.title.encode('utf-8'),
+                    host + tv.video.get_absolute_url(),
+                    language.language,
+                    round((end - start) / 60, 2),
+                    v.datetime_started.strftime("%Y-%m-%d %H:%M:%S"),
+                    old_version_counter,
+                ])
+
+                old_version_counter += 1
+
+        return rows
+
+    def process(self):
+        domain = Site.objects.get_current().domain
+        protocol = getattr(settings, 'DEFAULT_PROTOCOL')
+        host = '%s://%s' % (protocol, domain)
+
+        header = ['Video title', 'Video URL', 'Video language',
+                'Billable minutes', 'Version created', 'Language number']
+
+        rows = self._get_row_data(host, header)
+
+        fn = '/tmp/bill-%s-%s-%s-%s.csv' % (self.team.slug, self.start_str,
+                self.end_str, self.pk)
+
+        with open(fn, 'w') as f:
+            writer = csv.writer(f)
+            writer.writerows(rows)
+
+        self.csv_file = File(open(fn, 'r'))
+        self.processed = datetime.datetime.utcnow()
+        self.save()
+
+    @property
+    def start_str(self):
+        return self.start_date.strftime("%Y%m%d")
+
+    @property
+    def end_str(self):
+        return self.end_date.strftime("%Y%m%d")
+
+
+class Partner(models.Model):
+    name = models.CharField(_(u'name'), max_length=250, unique=True)
+    slug = models.SlugField(_(u'slug'), unique=True)
+    can_request_paid_captions = models.BooleanField(default=False)
+    
+    # The `admins` field specifies users who can do just about anything within
+    # the partner realm.
+    admins = models.ManyToManyField('auth.CustomUser',
+            related_name='managed_partners', blank=True, null=True)
+
+    def __unicode__(self):
+        return self.name
+
+    def is_admin(self, user):
+        return user in self.admins.all()
 

@@ -57,7 +57,6 @@ unisubs.translate.Dialog.State_ = {
     TRANSLATE: 0,
     EDIT_METADATA: 1
 };
-
 unisubs.translate.Dialog.prototype.createDom = function() {
     unisubs.translate.Dialog.superClass_.createDom.call(this);
     this.setDraggable(false);
@@ -207,7 +206,6 @@ unisubs.translate.Dialog.prototype.saveWorkInternal = function(closeAfterSave, s
 unisubs.translate.Dialog.prototype.showGuidelinesForState_ = function(state) {
     this.setState_(state);
 };
-
 unisubs.Dialog.prototype.setVisible = function(visible) {
     if (visible) {
         unisubs.Dialog.superClass_.setVisible.call(this, true);
@@ -251,7 +249,7 @@ unisubs.translate.Dialog.prototype.setState_ = function(state) {
 
     var s = unisubs.translate.Dialog.State_;
 
-    this.setExtraClass_();
+    this.setExtraClass_(' the-translate-panel');
 
     var nextSubPanel = this.makeCurrentStateSubtitlePanel_();
     var captionPanel = this.getCaptioningAreaInternal();
@@ -366,9 +364,10 @@ unisubs.translate.Dialog.prototype.forkImpl_ = function() {
     this.subtitleState_.fork();
     this.serverModel_.fork(this.standardSubState_);
     this.hideToFork();
-    this.opener_.openSubtitlingDialog(
+    var dialog = this.opener_.openSubtitlingDialog(
         this.serverModel_,
         this.subtitleState_);
+    this.opener_.onDialogOpened_(dialog);
 };
 unisubs.translate.Dialog.prototype.disposeCurrentPanels_ = function() {
     if (this.currentSubtitlePanel_) {

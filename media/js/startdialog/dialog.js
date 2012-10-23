@@ -209,12 +209,6 @@ unisubs.startdialog.Dialog.prototype.setFromContents_ = function() {
                 });
         }
 
-        if (this.subtitleAllowed_) {
-            fromLanguageContents.push(
-                [unisubs.startdialog.Dialog.FORK_VALUE,
-                    "Direct from video (more work)"]);
-        }
-
         var $d = goog.bind(this.getDomHelper().createDom,
                            this.getDomHelper());
         this.fromLanguageDropdown_ = this.makeDropdown_(
@@ -231,11 +225,19 @@ unisubs.startdialog.Dialog.prototype.setFromContents_ = function() {
     }
 };
 unisubs.startdialog.Dialog.prototype.addToLanguageSection_ = function($d) {
+    var blocked_languages = this.model_.blockedLanguages_ || [];
+
     var toLanguageContents = goog.array.map(
         this.model_.toLanguages(),
         function(l) {
-            return [l.KEY, l.toString(), l.LANGUAGE,
-                    (l.VIDEO_LANGUAGE ? l.VIDEO_LANGUAGE.DISABLED_TO : false)];
+            var disabled = false;
+            if (l.VIDEO_LANGUAGE) {
+                disabled = l.VIDEO_LANGUAGE.DISABLED_TO;
+            } else if (goog.array.contains(blocked_languages, l.LANGUAGE)) {
+                disabled = true;
+            }
+
+            return [l.KEY, l.toString(), l.LANGUAGE, disabled];
         });
 
     this.toLanguageDropdown_ = this.makeDropdown_(
@@ -247,11 +249,20 @@ unisubs.startdialog.Dialog.prototype.addToLanguageSection_ = function($d) {
            $d('span', null, 'Subtitle into: '),
            this.toLanguageDropdown_));
 
+    // Select the first non-disabled language by default.  If they're all
+    // disabled you're out of luck and things are gonna break, sorry.
     var renderedToLanguages = goog.dom.getElementByClass('to-language');
     var selected = goog.dom.getChildren(renderedToLanguages)[renderedToLanguages.selectedIndex];
-    if (selected.disabled) {
+    while (selected && selected.disabled) {
         var next = goog.dom.getNextElementSibling(selected);
         goog.dom.forms.setValue(renderedToLanguages, next.value);
+        selected = goog.dom.getChildren(renderedToLanguages)[renderedToLanguages.selectedIndex];
+    }
+
+    // If this is a first-time translate task, set the to-language to the
+    // language that we're translating into.
+    if (window.TASK_TRANSLATE_TO_LANGUAGE) {
+        goog.dom.forms.setValue(renderedToLanguages, window.TASK_TRANSLATE_TO_LANGUAGE);
     }
 };
 unisubs.startdialog.Dialog.prototype.addFromLanguageSection_ = function($d) {

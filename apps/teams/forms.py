@@ -238,6 +238,7 @@ class AddTeamVideoForm(BaseVideoBoundForm):
                 original_language.save()
 
         obj = super(AddTeamVideoForm, self).save(False)
+
         obj.video = video
         obj.team = self.team
         commit and obj.save()
@@ -251,35 +252,7 @@ class AddTeamVideosFromFeedForm(AddFromFeedForm):
         super(AddTeamVideosFromFeedForm, self).__init__(user, *args, **kwargs)
 
     def save(self, *args, **kwargs):
-        videos = super(AddTeamVideosFromFeedForm, self).save(*args, **kwargs)
-
-        team_videos = []
-        project = self.team.default_project
-        for video, video_created in videos:
-            try:
-                tv = TeamVideo.objects.get(video=video, team=self.team)
-                tv_created = False
-            except TeamVideo.DoesNotExist:
-                tv = TeamVideo(video=video, team=self.team, added_by=self.user,
-                               project=project)
-                tv.title = video.title
-                tv.description = video.description
-                tv.save()
-                tv_created = True
-            team_videos.append((tv, tv_created))
-
-        return team_videos
-
-    def success_message(self):
-        if not self.video_limit_routreach:
-            return _(u"%(count)s videos have been added. "
-                     u"It will take a minute or so for them to appear.")
-        else:
-            return _(u"%(count)s videos have been added. "
-                     u"It will take a minute or so for them to appear. "
-                     u"To add the remaining videos from this feed, "
-                     u"submit this feed again and make sure to "
-                     u'check "Save feed" box.')
+        super(AddTeamVideosFromFeedForm, self).save(team=self.team)
 
 class CreateTeamForm(BaseVideoBoundForm):
     logo = forms.ImageField(validators=[MaxFileSizeValidator(settings.AVATAR_MAX_SIZE)], required=False)
@@ -323,9 +296,9 @@ class TaskCreateForm(ErrorableModelForm):
     assignee = forms.ModelChoiceField(queryset=User.objects.none(), required=False)
 
     def __init__(self, user, team, team_video, *args, **kwargs):
-        non_display_form = False
+        self.non_display_form = False
         if kwargs.get('non_display_form'):
-            non_display_form = kwargs.pop('non_display_form')
+            self.non_display_form = kwargs.pop('non_display_form')
         super(TaskCreateForm, self).__init__(*args, **kwargs)
 
         self.user = user
@@ -339,7 +312,7 @@ class TaskCreateForm(ErrorableModelForm):
         self.fields['language'].choices = langs
         self.fields['assignee'].queryset = User.objects.filter(pk__in=team_user_ids)
 
-        if non_display_form:
+        if self.non_display_form:
             self.fields['type'].choices = Task.TYPE_CHOICES
 
     def _check_task_creation_subtitle(self, tasks, cleaned_data):
@@ -351,7 +324,6 @@ class TaskCreateForm(ErrorableModelForm):
         if self.team_video.subtitles_started():
             self.add_error(_(u"Subtitling of this video is already in progress."),
                            'type', cleaned_data)
-            return
 
     def _check_task_creation_translate(self, tasks, cleaned_data):
         if not self.team_video.subtitles_finished():
@@ -360,18 +332,28 @@ class TaskCreateForm(ErrorableModelForm):
             return
 
         sl = self.team_video.video.subtitle_language(cleaned_data['language'])
+
         if sl and sl.is_complete_and_synced():
             self.add_error(_(u"This language already has a complete set of subtitles."),
                            'language', cleaned_data)
-            return
 
+    def _check_task_creation_review_approve(self, tasks, cleaned_data):
+        if not self.non_display_form:
+            return
+            
+        lang = cleaned_data['language']
+        video = self.team_video.video
+        subtitle_language = video.subtitle_language(lang)
+
+        if not subtitle_language or not subtitle_language.has_version:
+            self.add_error(_(u"This language for this video does not exist or doesn't have a version."),
+                           'language', cleaned_data)
 
     def clean(self):
         cd = self.cleaned_data
 
         type = cd['type']
         lang = cd['language']
-        assignee = cd['assignee']
 
         team_video = self.team_video
         project, team = team_video.project, team_video.team
@@ -383,24 +365,16 @@ class TaskCreateForm(ErrorableModelForm):
         if any(not t.completed for t in existing_tasks):
             self.add_error(_(u"There is already a task in progress for that video/language."))
 
-        if assignee:
-            # TODO: Check perms
-            # if not can_assign_task(task, self.user):
-            #     self.add_error(_(u"You are not allowed to assign this task."),
-            #                    'assignee', cd)
-            pass
-
         type_name = Task.TYPE_NAMES[type]
 
         # TODO: Move into _check_task_creation_translate()?
-        if type_name == 'Translate':
-            if lang == '':
-                self.add_error(_(u"You must select a language for a Translate task."))
+        if type_name != 'Subtitle' and not lang:
+            self.add_error(_(u"You must select a language for a %s task." % type_name))
 
         {'Subtitle': self._check_task_creation_subtitle,
          'Translate': self._check_task_creation_translate,
-         'Review': lambda x, y: x,
-         'Approve': lambda x, y: x
+         'Review': self._check_task_creation_review_approve,
+         'Approve': self._check_task_creation_review_approve
         }[type_name](existing_tasks, cd)
 
         return cd
@@ -553,7 +527,6 @@ class InviteForm(forms.Form):
         self.fields['role'].choices = [(r, ROLE_NAMES[r])
                                        for r in roles_user_can_invite(team, user)]
 
-
     def clean_user_id(self):
         user_id = self.cleaned_data['user_id']
 
@@ -573,28 +546,21 @@ class InviteForm(forms.Form):
 
         self.user_id = user_id
         # check if there is already an invite pending for this user:
-        try:
-            invite = Invite.objects.get(team=self.team, user=invited_user)
-            if invite.approved == False:
-                raise forms.ValidationError(_(u'User has already declined this invite.'))
-            if invite.approved == None:
-                raise forms.ValidationError(_(u'User has already been invited.'))
-        except Invite.DoesNotExist:
-            pass
+        if Invite.objects.pending_for(team=self.team, user=invited_user).exists():
+                raise forms.ValidationError(_(u'User has already been invited and has not replied yet.'))
         return user_id
-
 
     def save(self):
         from messages import tasks as notifier
         user = User.objects.get(id=self.user_id)
-        invite, created = Invite.objects.get_or_create(team=self.team, user=user, defaults={
-            'note': self.cleaned_data['message'],
-            'author': self.user,
-            'role': self.cleaned_data['role'],
-        })
-
+        invite = Invite.objects.create(
+            team=self.team, user=user, author=self.user,
+            role= self.cleaned_data['role'],
+            note = self.cleaned_data['message'])
+        invite.save()
         notifier.team_invitation_sent.delay(invite.pk)
         return invite
+
 
 class ProjectForm(forms.ModelForm):
     class Meta:
@@ -688,7 +654,15 @@ class UploadDraftForm(forms.Form):
             if not encoding:
                 raise forms.ValidationError(_(u'Can not detect file encoding'))
 
-            self._parser = self._get_parser(subtitles.name)(force_unicode(text, encoding))
+            # for xml based formats, we can't just convert to unicode, as the
+            # parser will complain that the string encoding doesn't match
+            # what's encoding declaration in the xml file if it's not utf-8
+            self.extension = subtitles.name.split('.')[-1].lower()
+            if self.extension not in ('dfxp', 'ttml', 'xml'):
+                decoded = force_unicode(text, encoding)
+            else:
+                decoded = text
+            self._parser = ParserList[self.extension](decoded)
 
             if not self._parser:
                 raise forms.ValidationError(_(u'Incorrect subtitles format'))

@@ -374,7 +374,6 @@ INSTALLED_APPS = (
     'django_extensions',
     'djcelery',
     'haystack',
-    'livesettings',
     'rosetta',
     'raven.contrib.django',
     'sorl.thumbnail',
@@ -531,7 +530,6 @@ RECAPTCHA_PUBLIC = '6LdoScUSAAAAANmmrD7ALuV6Gqncu0iJk7ks7jZ0'
 RECAPTCHA_SECRET = ' 6LdoScUSAAAAALvQj3aI1dRL9mHgh85Ks2xZH1qc'
 
 ROSETTA_EXCLUDED_APPLICATIONS = (
-    'livesettings',
     'openid_consumer',
     'rosetta'
 )
@@ -707,6 +705,7 @@ MEDIA_BUNDLES = {
               "js/jquery.rpc.js",
               "js/jquery.input_replacement.min.js",
               "js/messages.js",
+              "js/escape.js",
               "js/libs/chosen.jquery.min.js",
               "js/libs/chosen.ajax.jquery.js",
               "js/jquery.autogrow-textarea.js",
@@ -756,6 +755,41 @@ MEDIA_BUNDLES = {
          ),
         "include_js_base_dependencies": False,
         "include_flash_deps": False,
+    },
+    "embedder":{
+        "type":"js",
+        "optimizations": "SIMPLE_OPTIMIZATIONS",
+        "closure_deps": "",
+        "files": (
+            "src/js/third-party/json2.min.js",
+            'src/js/third-party/underscore.min.js',
+            'src/js/third-party/zepto.min.js',
+            'src/js/third-party/backbone.min.js',
+            'src/js/third-party/popcorn.js',
+            'src/js/embedder/popcorn.amaratranscript.js',
+            'src/js/embedder/popcorn.amarasubtitle.js',
+            'src/js/embedder/conf.js',
+            'src/js/embedder/embedder.js'
+        ),
+        "include_js_base_dependencies": False,
+        "include_flash_deps": False,
+        #"output": 'release/public/embedder.js',
+        "ignore_closure": True,
+        "release_url": True,
+        "bootloader": { 
+            "gatekeeper": "_amaraEmbedderLoaded", 
+        }
+
+    },
+    "embedder-css":{
+        "type":"css",
+        "files": (
+            "src/css/embedder/embedder-dev.css",
+        ),
+        "include_js_base_dependencies": False,
+        "include_flash_deps": False,
+        "output": 'release/public/embedder.css',
+        "release_url": True,
     },
     "debug-embed-js": {
         "type": "js",

@@ -678,7 +678,7 @@ span.unisubs-widget {
     padding-left: 19px !important;
 }
 .unisubs-translateField {
-    height: 34px !important;
+    height: 24px !important;
     margin-top: 3px !important;
     padding: 3px !important;
     width: 350px !important;
@@ -978,7 +978,7 @@ ul.unisubs-titlesList li {
     list-style: none !important;
     margin: 0 !important;
     min-height: 23px !important;
-    padding: 10px !important;
+    padding: 5px 10px !important;
     position: relative !important;
 }
 ul.unisubs-titlesList li input.unisubs-translateInput {
@@ -1206,7 +1206,7 @@ ul.unisubs-titlesList.unisubs-beginTab .unisubs-beginTabLi {
 .unisubs-titlesList .unisubs-timestamp-time-fixed {
     font-weight: normal !important;
     color: #888 !important;
-    padding: 0 0 10px 10px !important;
+    padding: 0 0 3px 10px !important;
     font-size: 10px !important;
     float: right !important;
 }
@@ -1222,7 +1222,7 @@ ul.unisubs-titlesList.unisubs-beginTab .unisubs-beginTabLi {
     position: absolute !important;
     right: 50px !important;
     top: -1px !important;
-    width: 60px !important;
+    width: 75px !important;
 }
 .unisubs-timestamp.none {
     color: #aaa !important
@@ -1275,11 +1275,10 @@ ul.unisubs-titlesList.unisubs-beginTab .unisubs-beginTabLi {
     display: block !important
 }
 .unisubs-title {
-    .padding-top: 0px !important;
+    padding: 0px;
     cursor: pointer !important;
     display: block !important;
     line-height: 1.4em !important;
-    padding: 10px !important;
 }
 .is-rtl {
     direction: rtl;
@@ -1289,6 +1288,7 @@ ul.unisubs-titlesList.unisubs-beginTab .unisubs-beginTabLi {
     color: #C0C0C0;
     display: block;
     text-transform: uppercase;
+    width: 100% !important;
 }
 .unisubs-title:hover {
 
@@ -1298,10 +1298,7 @@ li span.unisubs-title textarea {
     -webkit-border-radius: 5px !important;
     background: #fcfcfc url("../images/gradient_light.png") 0 -135px repeat-x !important;
     padding: 3px !important;
-    width: 331px !important;
-}
-.unisubs-title-notime {
-    padding-left: 0 !important
+    width: 312px !important;
 }
 .unisubs-nextStep {
     background: #fcfcfc url("../images/gradient.png") 0 14px repeat-x !important;
@@ -2129,7 +2126,7 @@ embed#clippy {
 .unisubs-modal-lang p.warning {
     max-width: 300px
 }
-.unisubs-modal-lang h3, .unisubs-modal-completed h3 {
+.unisubs-modal-lang h3, .unisubs-forkdialog h3, .unisubs-modal-completed h3 {
     -moz-border-radius-topleft: 5px !important;
     -moz-border-radius-topright: 5px !important;
     background: url("../images/gradient.png") repeat-x scroll 0 0 #FFFFFF !important;
@@ -2148,6 +2145,12 @@ embed#clippy {
     margin: 0 !important;
     min-width: 300px !important;
     padding: 12px !important;
+}
+.unisubs-forkdialog li {
+    color: #666 !important;
+    font-size: 15px !important;
+    line-height: 15px !important;
+    padding: 6px 12px 6px 0 !important;
 }
 .unisubs-modal-lang div p.notice {
     color: #999 !important;
@@ -2863,4 +2866,35 @@ div.unisubs-transcript span {
 }
 .unisubs-needs-sync .unisubs-spanarrow {
     left: 171px !important;
+}
+textarea.copy-dialog {
+    height: 100px;
+    margin: 12px;
+    width: 90%;
+}
+select.copy-dialog-select {
+    margin: 12px;
+}
+ul.unisubs-titlesList span.unisubs-title {
+    padding-top: 20px !important;
+}
+div.the-translate-panel ul.unisubs-titlesList span.unisubs-title {
+    padding-top: 0 !important;
+}
+.unisubs-title-notime:after {
+    clear: both;
+    content: ".";
+    display: block;
+    height: 0;
+    visibility: hidden;
+}
+.unisubs-title-notime {
+    padding-left: 0 !important
+}
+.unisubs-title-notime span {
+    float: left;
+    width: 320px;
+}
+.unisubs-timestamp-time-fixed {
+    width: 50px !important;
 }

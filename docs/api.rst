@@ -161,6 +161,30 @@ ups.  The parameter can be sent as a parameter to any kind of API call.  This
 is useful if you already have a database of video ids and don't want to
 maintain a mapping between those ids and Amara ids.
 
+For example, let's say you have an Amara video with the id of ``yxsSV807Dcho``.
+Your application uses numeric id internally and you would like to tell Amara to
+remember that this video has an id of ``12345`` on your system.  You can modify
+the video like this:
+
+.. code-block:: bash
+
+    curl -i -X PUT -H "Accept: application/json" \
+        -H 'X-api-username: my_username_here' -H 'X-apikey: my_api_key_here' \
+        -H "Content-Type: application/json" \
+        --data '{"usePartnerId": true, "id": "12345"}' \
+        https://host/api2/partners/videos/yxsSV807Dcho/
+
+And then, you can start referencing the video by the numeric id when
+interacting with the API. For example, the following call will retrieve the
+above video.
+
+.. code-block:: bash
+
+    curl -i -X GET -H "Accept: application/json" \
+        -H 'X-api-username: my_username_here' -H 'X-apikey: my_api_key_here' \
+        -H "Content-Type: application/json" \
+        https://host/api2/partners/videos/12345/?usePartnerId=true
+
 Available Resources
 -------------------
 
@@ -473,17 +497,17 @@ Listing video urls
 
 Video URL detail:
 
-.. http:get:: /api2/partners/users/[video-id]/urls/[url-id]/
+.. http:get:: /api2/partners/videos/[video-id]/urls/[url-id]/
 
 Where the url-id can be fetched from the list of urls.
 
 Updating video-urls:
 
-.. http:put:: /api2/partners/users/[video-id]/urls/[url-id]/
+.. http:put:: /api2/partners/videos/[video-id]/urls/[url-id]/
 
 Creating video-urls:
 
-.. http:post:: /api2/partners/users/[video-id]/urls/
+.. http:post:: /api2/partners/videos/[video-id]/urls/
 
     :form url: Any URL that works for the regular site (mp4 files, youtube, vimeo,
         etc) can be used. Note that the url cannot be in use by another video.
@@ -496,7 +520,7 @@ Creating video-urls:
 
 To delete a url:
 
-.. http:delete:: /api2/partners/users/[video-id]/urls/[url-id]/
+.. http:delete:: /api2/partners/videos/[video-id]/urls/[url-id]/
 
 If this is the only URL for a video, the request will fail. A video must have
 at least one URL.
@@ -580,13 +604,36 @@ Example response
 Team Member Resource
 ~~~~~~~~~~~~~~~~~~~~
 
+This resource allows you to change team membership information without the
+target user's input.  This resource is only applicable to:
+
+* Teams associated with the partner's account
+* Users who are already members of one of the partner's teams
+
 You can list existing members of a team:
 
 .. http:get:: /api2/partners/teams/[team-slug]/members/
 
+Adding a new member to a team:
+
+.. http:post:: /api2/partners/teams/[team-slug]/members/
+
 Updating a team member (e.g. changing their role):
 
 .. http:put:: /api2/partners/teams/[team-slug]/members/[username]/
+
+Removing a user from a team:
+
+.. http:delete:: /api2/partners/teams/[team-slug]/members/[username]/
+
+Example of adding a new user:
+
+.. code-block:: json
+
+    {
+        "username": "test-user",
+        "role": "manager"
+    }
 
 Roles
 +++++
@@ -595,6 +642,33 @@ Roles
 * ``admin``
 * ``manager``
 * ``contributor``
+
+.. warning:: Changed behavior: the previous functionality was moved the Safe
+    Team Member Resource documented below.
+
+Permissions
++++++++++++
+
+If a user belongs to a partner team, any admin or above on any of the partner's
+teams can move the user anywhere within the partner's teams.  Moving is done by
+first adding the user to the target team and then by removing the user from the
+originating team.
+
+Safe Team Member Resource
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+This resource behaves the same as the normal Team Member resource with one
+small difference.  When you add a user to a team, we will send an invitation to
+the user to join the team.  If the user doesn't exist, we will create it.  The
+standard Team Member resource simply adds the user to the team and returns.
+
+Listing:
+
+.. http:get:: /api2/partners/teams/[team-slug]/safe-members/
+
+Adding a new member to a team:
+
+.. http:post:: /api2/partners/teams/[team-slug]/safe-members/
 
 Project Resource
 ~~~~~~~~~~~~~~~~
@@ -661,6 +735,13 @@ List all tasks for a given team:
         * ``type``      Task type (details below)
         * ``-type``     Task type (descending)
 
+    :query completed: Show only complete tasks
+    :query completed-before: Show only tasks completed before a given date
+        (unix timestamp)
+    :query completed-after: Show only tasks completed before a given date
+        (unix timestamp)
+    :query open: Show only incomplete tasks
+
 Task detail:
 
 .. http:get:: /api2/partners/teams/[team-slug]/tasks/[task-id]/
@@ -726,7 +807,7 @@ List activity items:
 
     :query team: Show only items related to a given team (team slug)
     :query video: Show only items related to a given video (video id)
-    :query action_type: Show only items with a given action type (int, see below)
+    :query type: Show only items with a given activity type (int, see below)
     :query language: Show only items with a given language (language code)
     :query before: A unix timestamp in seconds
     :query after: A unix timestamp in seconds
@@ -758,7 +839,7 @@ Example response:
 .. code-block:: json
 
     {
-        "action_type": 1,
+        "type": 1,
         "comment": null,
         "created": "2012-07-12T07:02:19",
         "id": "1339",
@@ -781,3 +862,50 @@ The message resource allows you to send messages to user and teams.
     :form team: Team's slug
 
 You can only send the ``user`` parameter or the ``team`` parameter at once.
+
+
+
+Application resource
+~~~~~~~~~~~~~~~~~
+
+For teams with membership by application only.
+
+List application items:
+
+.. http:get:: /api2/partners/teams/[team-slug]/applications
+
+    :query status: What status the application is at, possible values are 'Denied', 'Approved', 'Pending', 'Member Removed' and 'Member Left'
+    :query before: A unix timestamp in seconds
+    :query after: A unix timestamp in seconds
+    :query user: The username applying for the team
+
+Application item detail:
+
+.. http:get:: /api2/partners/teams/[team-slug]/application/[application-id]/
+
+Example response:
+
+.. code-block:: json
+
+    {
+       "created": "2012-08-09T17:48:48",
+       "id": "12",
+       "modified": null,
+       "note": "",
+       "resource_uri": "/api2/partners/teams/test-team/applications/12/",
+       "status": "Pending",
+       "user": "youtube-anonymous"
+
+    }   
+
+To delete an Application:
+
+.. http:delete:: /api2/partners/teams/[team-slug]/application/[application-id]/
+
+Applications can have their statuses updated:
+
+.. http:put:: /api2/partners/teams/[team-slug]/application/[application-id]/
+
+    :query status: What status the application is at, possible values are 'Denied', 'Approved', 'Pending', 'Member Removed' and 'Member Left'
+
+Note that if an application is pending (has the status='Pending'), the API can set it to whatever new status. Else, if the application has already been approved or denied, you won't be able to set the new status. For cases were an approval was wrongly issues, you'd want to remove the team member. Otherwise you'd want to invite the user to the team.

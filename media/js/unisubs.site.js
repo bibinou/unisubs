@@ -136,16 +136,33 @@ var Site = function(Site) {
             if (window.REQUEST_GET_LANG) {
                 $opt = $('option[id="lang-opt-' + window.REQUEST_GET_LANG + '"]');
             } else {
-                if($('#lang-opt-mine').length > 0 && window.USER_LANGS > 0){
-                    $opt = $('#lang-opt-mine');
-                } else {
-                    $opt = $('#lang-opt-any');
-                }
+                $opt = $('option[id="lang-opt-mine"]');
             }
 
             $select.children().removeAttr('selected');
             $opt.attr('selected', 'selected');
             $select.trigger('liszt:updated');
+        },
+        resetProjFilter: function($select) {
+            if (typeof $select == 'undefined') {
+                $select = $('select#project-filter');
+            }
+
+            if (window.REQUEST_GET_PROJECT) {
+                $opt = $('option[id="project-opt-' + window.REQUEST_GET_PROJECT + '"]');
+            } else {
+                $opt = $('option[id="project-opt-any"]');
+            }
+
+            // Reset the chosen selector if we have no query args indicating that we have
+            // a project.
+            //
+            // Unless this is the TED team, of course.
+            if (window.TEAM_SLUG != 'ted') {
+                $select.children().removeAttr('selected');
+                $opt.attr('selected', 'selected');
+                $select.trigger('liszt:updated');
+            }
         },
         collapsibleLists: function($lists) {
             $.each($lists, function() {
@@ -724,6 +741,7 @@ var Site = function(Site) {
 
             unisubs.widget.WidgetController.makeGeneralSettings(window.WIDGET_SETTINGS);
             that.Utils.resetLangFilter($('select#id_task_language'));
+            that.Utils.resetProjFilter();
             that.Utils.chosenify();
         },
         team_video_edit: function() {
@@ -790,6 +808,7 @@ var Site = function(Site) {
             });
 
             that.Utils.resetLangFilter();
+            that.Utils.resetProjFilter();
             that.Utils.chosenify();
         },
         team_settings_permissions: function() {

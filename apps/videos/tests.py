@@ -16,9 +16,11 @@
 # You should have received a copy of the GNU Affero General Public License
 # along with this program. If not, see
 # http://www.gnu.org/licenses/agpl-3.0.html.
+import codecs
 import feedparser
 import json
 import os
+import re
 from datetime import datetime
 from StringIO import StringIO
 
@@ -65,7 +67,7 @@ from videos.types.youtube import YoutubeVideoType, save_subtitles_for_lang
 from vidscraper.sites import blip
 from widget import video_cache
 from widget.rpc import Rpc
-from widget.srt_subs import DFXPSubtitles
+from widget.srt_subs import TTMLSubtitles
 from widget.tests import (
     create_two_sub_dependent_session, create_two_sub_session, RequestMockup,
     NotAuthenticatedUser
@@ -203,12 +205,13 @@ DFXP_TEXT = u'''<?xml version="1.0" encoding="UTF-8"?>
       <p begin="00:01:01.54" end="00:01:05.10">Plus we're adding more services all the time</p>
       <p begin="00:01:05.10" end="00:01:09.04">Universal Subtitles works with many popular video formats,</p>
       <p begin="00:01:09.04" end="00:01:14.35">such as MP4, theora, webM and over HTML 5.</p>
-      <p begin="00:01:14.35" end="00:01:19.61">Our goal is for every video on the web to be subtitlable so that anyone who cares about</p>
-      <p begin="00:01:19.61" end="00:01:23.31">the video can help make it more accessible.</p>
+      <p begin="00:01:14.35" end="00:01:19.61">This should be in <span tts:fontWeight="bold">bold</span></p>
+      <p begin="00:01:19.61" end="00:01:23.31">This should be in <span tts:fontStyle="italic">italic</span></p>
     </div>
   </body>
 </tt>
 '''
+
 class GenericTest(TestCase):
     def test_languages(self):
         langs = [l[1] for l in settings.ALL_LANGUAGES]
@@ -303,6 +306,25 @@ class BusinessLogicTest(TestCase):
             self.assertEqual(ens.start_time, frs.start_time)
             self.assertEqual(ens.end_time, frs.end_time)
         self.assertFalse(fr.is_forked)
+
+    def test_first_approved(self):
+        from apps.teams.moderation_const import APPROVED
+        language = SubtitleLanguage.objects.all()[0]
+
+        for i in range(1, 10):
+            SubtitleVersion.objects.create(language=language,
+                    datetime_started=datetime(2012, 1, i, 0, 0, 0),
+                    version_no=i)
+
+        v1 = SubtitleVersion.objects.get(language=language, version_no=3)
+        v2 = SubtitleVersion.objects.get(language=language, version_no=6)
+
+        v1.moderation_status = APPROVED
+        v1.save()
+        v2.moderation_status = APPROVED
+        v2.save()
+
+        self.assertEquals(v1.pk, language.first_approved_version.pk)
 
 
 class SubtitleParserTest(TestCase):
@@ -401,24 +423,7 @@ class SubtitleParserTest(TestCase):
             result[2], 16.1, 19.9,
             u'Ils ont eu raison, non seulement \nà cause de la célébrité de Richard')
 
-    def test_dfxp_parser(self):
-        parser = DfxpSubtitleParser(DFXP_TEXT)
-        result = list(parser)
-        self.assertEqual(len(result),19 )
-        line_break_sub  = result[6]
-        line_break_text = line_break_sub['subtitle_text']
-        self.assertTrue(line_break_text.startswith("Take an "))
-        self.assertTrue(line_break_text.find("\n") > -1)
-
-    def test_dfxp_serializer(self):
-        sub = {
-            'text': 'Here we\ngo!',
-            'start':1,
-            'end':2
-        }
-        serializer = DFXPSubtitles([sub])
-        result = unicode(serializer)
-        self.assertTrue(result.find("Here we<br/>go") > -1)
+       
 
 class WebUseTest(TestCase):
     def _make_objects(self, video_id="S7HMxzLmS9gw"):
@@ -827,14 +832,59 @@ class ViewsTest(WebUseTest):
         self._make_objects("iGzkk7nwWX8F")
         cache.clear()
 
-    def _test_video_url_make_primary(self):
-        #TODO: fix this test
+    def test_video_url_make_primary(self):
         self._login()
-        vu = VideoUrl.objects.all()[:1].get()
-        self._simple_test("videos:video_url_make_primary", data={'id': vu.id})
+        v = Video.objects.get(video_id='iGzkk7nwWX8F')
+        self.assertNotEqual(len(VideoUrl.objects.filter(video=v)), 0)
+        # add another url
+        secondary_url = 'http://www.youtube.com/watch?v=po0jY4WvCIc'
+        data = {
+            'url': secondary_url,
+            'video': v.pk
+        }
+        url = reverse('videos:video_url_create')
+        response = self.client.post(url, data)
+        self.assertEqual(response.status_code, 200)
+        vid_url = 'http://www.youtube.com/watch?v=rKnDgT73v8s'
+        # test make primary
+        vu = VideoUrl.objects.filter(video=v)
+        vu[0].make_primary()
+        self.assertEqual(VideoUrl.objects.get(video=v, primary=True).url, vid_url)
+        # check for activity
+        self.assertEqual(len(Action.objects.filter(video=v, action_type=Action.EDIT_URL)), 1)
+        vu[1].make_primary()
+        self.assertEqual(VideoUrl.objects.get(video=v, primary=True).url, secondary_url)
+        # check for activity
+        self.assertEqual(len(Action.objects.filter(video=v, action_type=Action.EDIT_URL)), 2)
+        # assert correct VideoUrl is retrieved
+        self.assertEqual(VideoUrl.objects.filter(video=v)[0].url, secondary_url)
 
-    def test_site_feedback(self):
-        self._simple_test("videos:site_feedback")
+    def test_video_url_make_primary_team_video(self):
+        self._login()
+        v = Video.objects.get(video_id='KKQS8EDG1P4')
+        self.assertNotEqual(len(VideoUrl.objects.filter(video=v)), 0)
+        # add another url
+        secondary_url = 'http://www.youtube.com/watch?v=tKTZoB2Vjuk'
+        data = {
+            'url': secondary_url,
+            'video': v.pk
+        }
+        url = reverse('videos:video_url_create')
+        response = self.client.post(url, data)
+        self.assertEqual(response.status_code, 200)
+        vid_url = 'http://www.youtube.com/watch?v=KKQS8EDG1P4'
+        # test make primary
+        vu = VideoUrl.objects.filter(video=v)
+        vu[0].make_primary()
+        self.assertEqual(VideoUrl.objects.get(video=v, primary=True).url, vid_url)
+        # check for activity
+        self.assertEqual(len(Action.objects.filter(video=v, action_type=Action.EDIT_URL)), 1)
+        vu[1].make_primary()
+        self.assertEqual(VideoUrl.objects.get(video=v, primary=True).url, secondary_url)
+        # check for activity
+        self.assertEqual(len(Action.objects.filter(video=v, action_type=Action.EDIT_URL)), 2)
+        # assert correct VideoUrl is retrieved
+        self.assertEqual(VideoUrl.objects.filter(video=v)[0].url, secondary_url)
 
     def test_index(self):
         self._simple_test('videos.views.index')
@@ -904,8 +954,43 @@ class ViewsTest(WebUseTest):
         self.assertEqual(len(mail.outbox), 1)
 
     def test_video_url_remove(self):
-        # TODO: write tests
-        pass
+        self._login()
+        v = Video.objects.get(video_id='iGzkk7nwWX8F')
+        # add another url since primary can't be removed
+        data = {
+            'url': 'http://www.youtube.com/watch?v=po0jY4WvCIc',
+            'video': v.pk
+        }
+        url = reverse('videos:video_url_create')
+        response = self.client.post(url, data)
+        self.assertEqual(response.status_code, 200)
+        vid_urls = VideoUrl.objects.filter(video=v)
+        self.assertEqual(len(vid_urls), 2)
+        vurl_id = vid_urls[1].id
+        # check cache
+        self.assertEqual(len(video_cache.get_video_urls(v.video_id)), 2)
+        response = self.client.get(reverse('videos:video_url_remove'), {'id': vurl_id})
+        # make sure get is not allowed
+        self.assertEqual(response.status_code, 405)
+        # check post
+        response = self.client.post(reverse('videos:video_url_remove'), {'id': vurl_id})
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(VideoUrl.objects.filter(video=v)), 1)
+        self.assertEqual(len(Action.objects.filter(video=v, \
+            action_type=Action.DELETE_URL)), 1)
+        # assert cache is invalidated
+        self.assertEqual(len(video_cache.get_video_urls(v.video_id)), 1)
+
+    def test_video_url_deny_remove_primary(self):
+        self._login()
+        v = Video.objects.get(video_id='iGzkk7nwWX8F')
+        vurl_id = VideoUrl.objects.filter(video=v)[0].id
+        # make primary
+        vu = VideoUrl.objects.filter(video=v)
+        vu[0].make_primary()
+        response = self.client.post(reverse('videos:video_url_remove'), {'id': vurl_id})
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(len(VideoUrl.objects.filter(video=v)), 1)
 
     def test_video(self):
         self.video.title = 'title'
@@ -1378,11 +1463,22 @@ class TestFeedsSubmit(TestCase):
     def test_video_feed_submit(self):
         old_count = Video.objects.count()
         data = {
-            'feed_url': u'http://blip.tv/day9tv/rss'
+            'feed_url': u'http://blip.tv/coxman/rss'
         }
         response = self.client.post(reverse('videos:create_from_feed'), data)
         self.assertRedirects(response, reverse('videos:create'))
         self.assertNotEqual(old_count, Video.objects.count())
+        self.assertEqual(Video.objects.count(), 7)
+
+    def test_video_youtube_username_submit(self):
+        old_count = Video.objects.count()
+        data = {
+            'usernames': u'fernandotakai'
+        }
+        response = self.client.post(reverse('videos:create_from_feed'), data)
+        self.assertRedirects(response, reverse('videos:create'))
+        self.assertNotEqual(old_count, Video.objects.count())
+        self.assertEqual(Video.objects.count(), 17)
 
     def test_empty_feed_submit(self):
         base_open_resource = feedparser._open_resource
@@ -1421,7 +1517,6 @@ class TestFeedsSubmit(TestCase):
         self.assertEqual(vf.last_link, '')
 
         feedparser._open_resource = base_open_resource
-
 
 class BrightcoveVideoTypeTest(TestCase):
     def setUp(self):
@@ -2533,6 +2628,7 @@ class BaseDownloadTest(object):
             'video_id': language.video.video_id,
             'lang_pk': language.pk
         })
+        self.assertEqual(res.status_code, 200)
         return res.content
 
 class TestSRT(WebUseTest, BaseDownloadTest):
@@ -2579,7 +2675,51 @@ class TestSRT(WebUseTest, BaseDownloadTest):
         self.assertIn(" *multiline\nitalics*", subs[1].text)
         self.assertNotIn("script", subs[2].text)
 
+class DFXPTest(WebUseTest, BaseDownloadTest):
+    def setUp(self):
+        self.auth = dict(username='admin', password='admin')
+        self.video = Video.get_or_create_for_url("http://www.example.com/video.mp4")[0]
+        self.language = SubtitleLanguage.objects.get_or_create(
+            video=self.video, is_forked=True, language='en')[0]
 
+    def tearDown(self):
+        TTMLSubtitles.use_named_styles = True
+
+    def test_dfxp_parser(self):
+        fixture_path = os.path.join(settings.PROJECT_ROOT, 'apps', 'videos', 'fixtures', 'sample.dfxp')
+        input_text =  codecs.open(fixture_path, 'r', encoding='utf-8').read()
+        parser = DfxpSubtitleParser(input_text)
+        result = list(parser)
+        self.assertEqual(len(result),3 )
+        line_break_sub  = result[0]
+        line_break_text = line_break_sub['subtitle_text']
+        self.assertEqual(line_break_text, "Don't worry\nbe happy\nDon't worry\nbe happy")
+        self.assertTrue(line_break_text.find("\n") > -1)
+        italic_sub = result[1]
+        italic_text = italic_sub['subtitle_text']
+        self.assertEquals(italic_text, "This should be in *italic*")
+
+        bold_sub = result[2]
+        bold_text = bold_sub['subtitle_text']
+        self.assertEquals(bold_text, "This should be in **bold**")
+
+    def test_dfxp_serializer(self):
+        TTMLSubtitles.use_named_styles = False
+        add_subs(self.language, [ 'Here we\ngo! This must be **bold** and this in *italic* and this with _underline_'])
+        content = self._download_subs(self.language, 'dfxp')
+        self.assertTrue(re.findall('[\s]*Here we[\s]*<br/>[\s]*go', content))
+        self.assertTrue(re.findall('<span style="strong">[\s]*bold[\s]*</span>', content))
+        self.assertTrue(re.findall('<span style="emphasis">[\s]*italic[\s]*</span>', content))
+        self.assertTrue(re.findall('<span style="underlined">[\s]*underline[\s]*</span>', content))
+
+    def test_dfxp_serializer_inline(self):
+        add_subs(self.language, [ 'Here we\ngo! This must be **bold** and this in *italic* and this with _underline_'])
+        content = self._download_subs(self.language, 'dfxp')
+        self.assertTrue(re.findall('[\s]*Here we[\s]*<br/>[\s]*go', content))
+        self.assertTrue(re.findall('<span tts:fontWeight="bold">[\s]*bold[\s]*</span>', content))
+        self.assertTrue(re.findall('<span tts:fontStyle="italic">[\s]*italic[\s]*</span>', content))
+        self.assertTrue(re.findall('<span tts:textDecoration="underline">[\s]*underline[\s]*</span>', content))
+ 
 def add_subs(language, subs_texts):
     version = language.version()
     version_no = 0

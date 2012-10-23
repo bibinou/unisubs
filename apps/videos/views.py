@@ -21,6 +21,7 @@ from django.http import HttpResponse, Http404, HttpResponseRedirect, HttpRespons
 from django.shortcuts import render_to_response, get_object_or_404, redirect
 from django.template import RequestContext
 from django.views.generic.list_detail import object_list
+from django.views.decorators.http import require_http_methods
 from videos.models import Video, Action, SubtitleLanguage, SubtitleVersion,  \
     VideoUrl, AlreadyEditingException, restrict_versions
 from videos.forms import VideoForm, FeedbackForm, EmailFriendForm, UserTestResultForm, \
@@ -54,6 +55,7 @@ from utils.decorators import never_in_prod
 from utils.metrics import Meter
 from utils.translation import get_user_languages_from_request
 from django.utils.http import urlquote_plus
+from videos import permissions
 from videos.tasks import video_changed_tasks
 from videos.search_indexes import VideoIndex
 import datetime
@@ -236,7 +238,6 @@ def _get_related_task(request):
     """
     task_pk = request.GET.get('t', None)
     if task_pk:
-        from teams.models import Task
         from teams.permissions import can_perform_task
         try:
             task = Task.objects.get(pk=task_pk)
@@ -321,17 +322,6 @@ def feedback(request, hide_captcha=False):
     else:
         output['errors'] = form.get_errors()
     return HttpResponse(json.dumps(output), "text/javascript")
-
-def site_feedback(request):
-    text = request.GET.get('text', '')
-    email = ''
-    if request.user.is_authenticated():
-        email = request.user.email
-    initial = dict(message=text, email=email)
-    form = FeedbackForm(initial=initial)
-    return render_to_response(
-        'videos/site_feedback.html', {'form':form},
-        context_instance=RequestContext(request))
 
 def email_friend(request):
     text = request.GET.get('text', '')
@@ -522,7 +512,7 @@ def diffing(request, first_version, second_pk):
         # this is either a bad bug, or someone evil
         raise "Revisions for diff videos"
     video = first_version.language.video
-    if second_version.datetime_started > first_version.datetime_started:
+    if second_version.version_no > first_version.version_no:
         first_version, second_version = second_version, first_version
 
     second_captions = dict([(item.subtitle_id, item) for item in second_version.ordered_subtitles()])
@@ -623,42 +613,55 @@ def counter(request):
     return HttpResponse('draw_unisub_counter({videos_count: %s})' % count)
 
 @login_required
+@require_http_methods(['POST'])
 def video_url_make_primary(request):
     output = {}
-
-    id = request.GET.get('id')
+    id = request.POST.get('id')
+    status = 200
     if id:
         try:
             obj = VideoUrl.objects.get(id=id)
-            if not obj.video.allow_video_urls_edit and not request.user.has_perm('videos.change_videourl'):
+            tv = obj.video.get_team_video()
+            if tv and not permissions.can_user_edit_video_urls(obj.video, request.user):
                 output['error'] = ugettext('You have not permission change this URL')
+                status = 403
             else:
-                VideoUrl.objects.filter(video=obj.video).update(primary=False)
-                obj.primary = True
-                obj.save(updates_timestamp=False)
+                obj.make_primary(user=request.user)
         except VideoUrl.DoesNotExist:
             output['error'] = ugettext('Object does not exist')
-    return HttpResponse(json.dumps(output))
+            status = 404
+    return HttpResponse(json.dumps(output), status=status)
 
 @login_required
+@require_http_methods(['POST'])
 def video_url_remove(request):
     output = {}
-    id = request.GET.get('id')
-
+    id = request.POST.get('id')
+    status = 200
     if id:
         try:
             obj = VideoUrl.objects.get(id=id)
-
-            if not obj.video.allow_video_urls_edit and not request.user.has_perm('videos.delete_videourl'):
+            tv = obj.video.get_team_video()
+            if tv and not permissions.can_user_edit_video_urls(obj.video, request.user):
                 output['error'] = ugettext('You have not permission delete this URL')
+                status = 403
             else:
-                if obj.original:
-                    output['error'] = ugettext('You cann\'t remove original URL')
+                if obj.primary:
+                    output['error'] = ugettext('You can\'t remove primary URL')
+                    status = 403
                 else:
+                    # create activity record
+                    act = Action(video=obj.video, action_type=Action.DELETE_URL)
+                    act.new_video_title = obj.url
+                    act.created = datetime.datetime.now()
+                    act.user = request.user
+                    act.save()
+                    # delete
                     obj.delete()
         except VideoUrl.DoesNotExist:
             output['error'] = ugettext('Object does not exist')
-    return HttpResponse(json.dumps(output))
+            status = 404
+    return HttpResponse(json.dumps(output), status=status)
 
 @login_required
 def video_url_create(request):
@@ -688,6 +691,18 @@ def video_url_create(request):
         output['errors'] = form.get_errors()
 
     return HttpResponse(json.dumps(output))
+
+@staff_member_required
+def reindex_video(request, video_id):
+    from teams.tasks import update_one_team_video
+
+    video = get_object_or_404(Video, video_id=video_id)
+    video.update_search_index()
+
+    team_video = video.get_team_video()
+
+    if team_video:
+        update_one_team_video.delay(team_video.id)
 
 def subscribe_to_updates(request):
     email_address = request.POST.get('email_address', '')
@@ -719,6 +734,9 @@ def video_debug(request, video_id):
     from apps.testhelpers.views import debug_video
     from apps.widget import video_cache as vc
     from django.core.cache import cache
+    from accountlinker.models import youtube_sync
+    from videos.models import VIDEO_TYPE_YOUTUBE
+
     video = get_object_or_404(Video, video_id=video_id)
     lang_info = debug_video(video)
     vid = video.video_id
@@ -735,8 +753,18 @@ def video_debug(request, video_id):
         "writelocked_langs": cache.get(vc._video_writelocked_langs_key(vid)),
     }
     tasks = Task.objects.filter(team_video=video)
+
+    is_youtube = video.videourl_set.filter(type=VIDEO_TYPE_YOUTUBE).count() != 0
+
+    if request.method == 'POST' and request.POST.get('action') == 'sync':
+        # Sync video to youtube
+        sync_lang = SubtitleLanguage.objects.get(
+                pk=request.POST.get('language'))
+        youtube_sync(video, sync_lang)
+
     return render_to_response("videos/video_debug.html", {
-            'video':video,
+            'video': video,
+            'is_youtube': is_youtube,
             'lang_info': lang_info,
             'tasks': tasks,
             "cache": cache
